@@ -1,0 +1,646 @@
+/* AE Monitor — 深色交易台风格 */
+
+:root {
+  --bg-deep: #0b0f14;
+  --bg-surface: #121824;
+  --bg-elevated: #1a2230;
+  --border: rgba(94, 123, 168, 0.22);
+  --border-strong: rgba(61, 139, 253, 0.35);
+  --text: #e8eef6;
+  --text-muted: #8a9bb0;
+  --accent: #3d8bfd;
+  --accent-dim: rgba(61, 139, 253, 0.15);
+  --success: #34d399;
+  --success-dim: rgba(52, 211, 153, 0.12);
+  --danger: #f87171;
+  --danger-dim: rgba(248, 113, 113, 0.12);
+  --warning: #fbbf24;
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  --font: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font);
+  background: var(--bg-deep);
+  background-image:
+    radial-gradient(ellipse 120% 80% at 50% -20%, rgba(61, 139, 253, 0.08), transparent 55%),
+    radial-gradient(ellipse 80% 50% at 100% 100%, rgba(52, 211, 153, 0.04), transparent 45%);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+/* —— 顶栏 —— */
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.25rem;
+  padding: 1.1rem clamp(1rem, 3vw, 2.75rem) 1.25rem;
+  box-sizing: border-box;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+.header-left h1 {
+  margin: 0 0 0.85rem;
+  font-size: clamp(1.05rem, 2.5vw, 1.35rem);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.header-right {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* 状态条 */
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem 1.25rem;
+  padding: 0.5rem 0;
+}
+
+.status-bar-secondary {
+  padding-top: 0;
+  margin-top: -0.25rem;
+  opacity: 0.95;
+}
+
+.status-item {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+.status-item span:not(.status-dot):not(.pnl-value) {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+.status-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  box-shadow: 0 0 0 2px var(--bg-elevated);
+  flex-shrink: 0;
+}
+
+.status-dot.running {
+  background: var(--success);
+  box-shadow: 0 0 12px rgba(52, 211, 153, 0.6);
+  animation: pulse-dot 1.8s ease-in-out infinite;
+}
+
+.status-dot.exchange-ok {
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(61, 139, 253, 0.45);
+}
+
+.status-dot.exchange-down {
+  background: var(--danger);
+  box-shadow: 0 0 10px rgba(248, 113, 113, 0.45);
+}
+
+.status-dot.exchange-unknown {
+  background: var(--text-muted);
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.85;
+    transform: scale(1.08);
+  }
+}
+
+/* 盈亏颜色（可由 JS 挂 class） */
+.pnl-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.pnl-value.pnl-positive,
+.pnl-positive {
+  color: var(--success);
+}
+
+.pnl-value.pnl-negative,
+.pnl-negative {
+  color: var(--danger);
+}
+
+/* —— 按钮 —— */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0.5rem 1rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  font-family: inherit;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s, box-shadow 0.15s;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: rgba(61, 139, 253, 0.12);
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: #b8d4ff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: rgba(61, 139, 253, 0.28);
+  color: #fff;
+}
+
+.btn-success {
+  background: var(--success-dim);
+  border-color: rgba(52, 211, 153, 0.45);
+  color: #6ee7b7;
+}
+
+.btn-success:hover:not(:disabled) {
+  background: rgba(52, 211, 153, 0.22);
+  color: #d1fae5;
+}
+
+.btn-danger {
+  background: var(--danger-dim);
+  border-color: rgba(248, 113, 113, 0.45);
+  color: #fca5a5;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.22);
+  color: #fee2e2;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* —— 主区域（全宽自适应，仅保留随视口变化的左右留白） —— */
+.main-content {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 1.5rem clamp(1rem, 3vw, 2.75rem);
+  box-sizing: border-box;
+}
+
+/* 主区 1:1 两列：左（持仓 + 日志），右（图表） */
+.dashboard-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.25rem;
+  align-items: stretch;
+}
+
+.dashboard-col {
+  min-width: 0;
+}
+
+.dashboard-col-left {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.dashboard-col-right {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.dashboard-col .section {
+  margin-bottom: 0;
+}
+
+.positions-panel .positions-container {
+  overflow-x: auto;
+}
+
+.tv-chart-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.tv-chart-panel .tv-chart-wrap {
+  flex: 1 1 auto;
+  min-height: clamp(380px, 52vh, 640px);
+  height: auto;
+}
+
+.section {
+  margin-bottom: 2rem;
+}
+
+.section h2 {
+  margin: 0 0 0.85rem;
+  font-size: 1rem;
+  font-weight: 650;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+
+/* TradingView 图表区 */
+.tv-chart-section .tv-chart-wrap {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.tv-chart-section .tradingview-widget-container {
+  height: 100%;
+  width: 100%;
+}
+
+.tv-chart-section .tradingview-widget-container__widget {
+  height: calc(100% - 2px);
+  width: 100%;
+}
+
+.tv-chart-note {
+  margin: 0.65rem 0 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.tv-chart-note code {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+/* 持仓区 */
+.positions-container {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  min-height: 120px;
+}
+
+.empty-state {
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.positions-container table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+
+.positions-container thead th {
+  text-align: left;
+  padding: 0.65rem 1rem;
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+
+.positions-container tbody td {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+.positions-container tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.positions-container tbody tr:hover {
+  background: rgba(61, 139, 253, 0.05);
+}
+
+.positions-container .row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.positions-container .row-actions .btn {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.75rem;
+}
+
+.position-card {
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.position-card:last-child {
+  border-bottom: none;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.badge-long {
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--success);
+}
+
+.badge-short {
+  background: rgba(248, 113, 113, 0.15);
+  color: #fecaca;
+}
+
+/* 日志 */
+.logs-container {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.logs-content {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  max-height: 360px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.55;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.logs-content::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.logs-content::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+/* —— 弹窗 —— */
+.modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(5, 8, 12, 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.modal.is-open,
+.modal.open {
+  display: flex;
+}
+
+.modal-content {
+  width: 100%;
+  max-width: 440px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  animation: modal-in 0.22s ease-out;
+}
+
+.modal-small {
+  max-width: 380px;
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.2rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+.modal-close {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.2rem;
+  border-radius: var(--radius-sm);
+}
+
+.modal-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.modal-body {
+  padding: 1.15rem 1.2rem;
+}
+
+.modal-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  padding: 1rem 1.2rem;
+  border-top: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.form-group {
+  margin-bottom: 1rem;
+}
+
+.form-group:last-child {
+  margin-bottom: 0;
+}
+
+.form-group label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 0.35rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.form-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  padding: 0.4rem 0;
+}
+
+.form-input {
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  font-size: 0.9rem;
+  font-family: var(--mono);
+  color: var(--text);
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-top: 0.25rem;
+}
+
+.form-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+.form-hint {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+/* API 仅界面提示条（若 JS 注入） */
+.api-banner {
+  margin: 1rem clamp(1rem, 3vw, 2.75rem) 0;
+  padding: 0.65rem 1rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  background: rgba(251, 191, 36, 0.08);
+  color: #fcd34d;
+  max-width: none;
+  box-sizing: border-box;
+}
+
+/* 小屏 */
+@media (max-width: 960px) {
+  .dashboard-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .header {
+    flex-direction: column;
+  }
+
+  .header-right {
+    width: 100%;
+  }
+
+  .header-right .btn {
+    flex: 1;
+    min-width: calc(50% - 0.25rem);
+  }
+
+  .main-content {
+    padding: 1rem;
+  }
+
+  .positions-container {
+    overflow-x: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+  }
+}
