@@ -1,0 +1,18 @@
+{# 父模板需先 {% set active_nav = 'monitor' %} 或 'params' #}
+<aside class="app-sidebar{% if active_nav == 'monitor' %} app-sidebar--monitor{% endif %}" aria-label="主导航">
+    <div class="app-sidebar-brand">AE</div>
+    <nav class="app-sidebar-nav" aria-label="页面">
+        <a href="{{ url_for('index') }}" class="app-sidebar-link {% if active_nav == 'monitor' %}is-active{% endif %}{% if active_nav == 'params' %} ae-nav-monitor{% endif %}">监控</a>
+        <a href="{{ url_for('params_page') }}" class="app-sidebar-link {% if active_nav == 'params' %}is-active{% endif %}">参数编辑</a>
+    </nav>
+    {% if active_nav == 'monitor' %}
+    <div class="app-sidebar-actions" aria-label="交易与刷新">
+        <button type="button" class="btn btn-success app-sidebar-action-btn" id="btn-start" onclick="startTrading()">🟢 启动交易</button>
+        <button type="button" class="btn btn-danger app-sidebar-action-btn" id="btn-stop" onclick="stopTrading()" disabled>⏹️ 停止交易</button>
+        <button type="button" class="btn btn-primary app-sidebar-action-btn" onclick="manualScan()">🔍 手动扫描</button>
+        <button type="button" class="btn btn-primary app-sidebar-action-btn" onclick="refreshData()">🔄 刷新</button>
+        <button type="button" class="btn btn-primary app-sidebar-action-btn" id="btn-download-daily-report" title="下载 logs 下当日 UTC 日报 txt">📄 下载日报</button>
+        <span id="last-updated" class="app-sidebar-updated"></span>
+    </div>
+    {% endif %}
+</aside>

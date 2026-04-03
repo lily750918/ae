@@ -4,14 +4,18 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AE 监控系统</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=37">
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
+{% set active_nav = 'monitor' %}
+<div class="app-shell">
+{% include '_nav.html' %}
+<div class="app-body">
     <!-- 头部 -->
-    <header class="header">
+    <header class="header header--two-col">
         <div class="header-left">
             <h1>🚀 AE 自动交易系统 v2.0</h1>
-            <!-- 第一行：主要信息 -->
             <div class="status-bar">
                 <span class="status-item">账户总值: $<span id="total-balance">0.00</span></span>
                 <span class="status-item">持仓: <span id="positions-count">0</span></span>
@@ -25,18 +29,14 @@
                     <span id="exchange-status-text">交易所 —</span>
                 </span>
             </div>
-            <!-- 第二行：盈亏信息 -->
             <div class="status-bar status-bar-secondary">
                 <span class="status-item">可用余额: $<span id="available-balance">0.00</span></span>
                 <span class="status-item">未实现盈亏: <span id="unrealized-pnl" class="pnl-value">$0.00</span></span>
                 <span class="status-item">今日盈亏: <span id="daily-pnl" class="pnl-value">$0.00</span></span>
             </div>
         </div>
-        <div class="header-right">
-            <button class="btn btn-success" id="btn-start" onclick="startTrading()">🟢 启动交易</button>
-            <button class="btn btn-danger" id="btn-stop" onclick="stopTrading()" disabled>⏹️ 停止交易</button>
-            <button class="btn btn-primary" onclick="manualScan()">🔍 手动扫描</button>
-            <button class="btn btn-secondary" onclick="refreshData()">🔄 刷新</button>
+        <div id="strategy-params-container" class="header-params-block">
+            <div style="font-size:0.72rem;color:var(--text-muted)">加载中…</div>
         </div>
     </header>
 
@@ -45,30 +45,71 @@
         <div class="dashboard-split">
             <div class="dashboard-col dashboard-col-left">
                 <section class="section positions-panel">
-                    <h2>📊 当前持仓</h2>
+                    <!-- <h2>📊 当前持仓</h2> -->
+                    <span class="chart-col-title">📊 当前持仓</span>
                     <div id="positions-container" class="positions-container">
                         <div class="empty-state">暂无持仓</div>
                     </div>
                 </section>
-                <section class="section logs-section">
-                    <h2>📝 系统日志</h2>
-                    <div class="logs-container">
-                        <div id="logs-content" class="logs-content"></div>
+                <section class="section">
+                    <div class="tab-bar">
+                        <button class="tab-btn tab-btn-active" data-tab="trade">📋 交易记录</button>
+                        <button class="tab-btn" data-tab="signal">📡 信号记录</button>
+                    </div>
+                    <div id="tab-panel-trade">
+                        <div class="export-bar" aria-label="导出交易记录">
+                            <span class="export-bar-label">导出 CSV（按平仓/开仓时间）</span>
+                            <div class="export-bar-inputs">
+                                <label>开始 <input type="datetime-local" id="trade-export-start" step="60"></label>
+                                <label>结束 <input type="datetime-local" id="trade-export-end" step="60"></label>
+                                <button type="button" class="btn btn-secondary btn-sm" id="btn-export-trade">下载</button>
+                            </div>
+                            <span class="export-bar-hint">留空则导出全部；时间为本机时区</span>
+                        </div>
+                        <div id="trade-history-container">
+                            <div class="empty-state">暂无交易记录</div>
+                        </div>
+                    </div>
+                    <div id="tab-panel-signal" style="display:none">
+                        <div class="export-bar" aria-label="导出信号记录">
+                            <span class="export-bar-label">导出 CSV（按扫描时间 scan_time）</span>
+                            <div class="export-bar-inputs">
+                                <label>开始 <input type="datetime-local" id="signal-export-start" step="60"></label>
+                                <label>结束 <input type="datetime-local" id="signal-export-end" step="60"></label>
+                                <button type="button" class="btn btn-secondary btn-sm" id="btn-export-signal">下载</button>
+                            </div>
+                            <span class="export-bar-hint">留空则导出全部；时间为本机时区</span>
+                        </div>
+                        <div id="signal-history-container">
+                            <div class="empty-state">暂无信号记录</div>
+                        </div>
                     </div>
                 </section>
             </div>
 
             <div class="dashboard-col dashboard-col-right">
-                <section class="section tv-chart-section tv-chart-panel">
-                    <h2>📈 BTCUSDT · 日线（TradingView）</h2>
-                    <div class="tv-chart-wrap">
-                        <div class="tradingview-widget-container">
-                            <div class="tradingview-widget-container__widget"></div>
-                            <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
+                <div class="chart-split-container">
+                    <!-- 左侧：当前选中持仓的图表 -->
+                    <div class="chart-col-positions">
+                        <div class="chart-col-header">
+                            <span class="chart-col-title">📊 持仓图表</span>
+                            <span id="position-chart-symbol" class="chart-symbol-label">—</span>
+                        </div>
+                        <div id="position-chart-widget" class="position-chart-container">
+                            <div class="empty-state">暂无持仓</div>
+                        </div>
+                    </div>
+                    <!-- 右侧：主图 -->
+                    <div class="chart-col-main">
+                        <div class="chart-col-header">
+                            <span class="chart-col-title">📈 BTCUSDT · 日线</span>
+                        </div>
+                        <div class="position-chart-container">
+                            <div class="tradingview-widget-container">
+                                <div class="tradingview-widget-container__widget"></div>
+                                <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
 {
   "autosize": true,
-  "height": "100%",
-  "width": "100%",
   "symbol": "BINANCE:BTCUSDT",
   "interval": "D",
   "timezone": "Etc/UTC",
@@ -84,10 +125,17 @@
   "hide_volume": false,
   "support_host": "https://www.tradingview.com"
 }
-                            </script>
+                                </script>
+                            </div>
                         </div>
                     </div>
-                    <p class="tv-chart-note">币安现货 BTCUSDT · 默认日 K；可在工具栏切换周期 / 品种。</p>
+                </div>
+                <section class="section logs-section logs-section-right">
+                    <h2>📝 系统日志</h2>
+                    <p class="logs-hint">展示要点：告警/错误全保留，并过滤高频无关 INFO。完整内容见服务器 <code>logs/</code> 下文件。</p>
+                    <div class="logs-container">
+                        <div id="logs-content" class="logs-content"></div>
+                    </div>
                 </section>
             </div>
         </div>
@@ -147,6 +195,8 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}?v=30"></script>
+</div>
+</div>
 </body>
 </html>

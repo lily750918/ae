@@ -111,5 +111,5 @@ python ae_server.py
 
 ## 9. 相关模块
 
-- **`binance_api.py` / `binance_sdk.py`**：交易所封装（如使用）。
+- **Binance 对接**：实盘与 Web 均以 `ae_server.py` + **`python-binance`**（REST）为准，见 `requirements.txt`。
 - **`hm1l/hm1l.py`**：回测与策略参考实现，与 AE 卖量暴涨逻辑对齐；服务器实盘以 `ae_server.py` 为准。

@@ -13,7 +13,7 @@ AE Server - Auto Exchange 自动交易软件（服务器版本）
 创建时间：2026-02-12
 """
 
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, request, render_template, Response, send_file, stream_with_context
 from flask_cors import CORS
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -22,12 +22,21 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import threading
 import time
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import csv
+import io
+import re
+from collections import defaultdict
+from logging.handlers import RotatingFileHandler
 import requests
+from requests.adapters import HTTPAdapter
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import os
 import configparser
+import tempfile
 import signal
 import sys
 import glob
@@ -41,14 +50,16 @@ log_dir = "logs"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"ae_server_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+_file_handler = RotatingFileHandler(
+    log_file,
+    maxBytes=20 * 1024 * 1024,
+    backupCount=14,
+    encoding='utf-8',
 )
+_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 
 
 def flush_logging_handlers() -> None:
@@ -58,11 +69,78 @@ def flush_logging_handlers() -> None:
             handler.flush()
 
 
+def _log_asctime_local() -> str:
+    """与 logging.basicConfig 默认 asctime 一致：YYYY-MM-DD HH:MM:SS,mmm（本地时区）。"""
+    t = datetime.now()
+    return t.strftime('%Y-%m-%d %H:%M:%S') + f",{t.microsecond // 1000:03d}"
+
+
+def _position_change_fmt_value(value) -> str:
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+# python-binance 共用同一 Session；扫描/预热使用 ThreadPoolExecutor(max_workers=20)，
+# 而 urllib3 默认每主机 pool_maxsize=10，并发超过时会刷屏「Connection pool is full」。
+_BINANCE_HTTP_POOL_MAX = 32
+
+
+def _configure_binance_http_adapter(session: Optional[requests.Session]) -> None:
+    if session is None:
+        return
+    adapter = HTTPAdapter(
+        pool_connections=_BINANCE_HTTP_POOL_MAX,
+        pool_maxsize=_BINANCE_HTTP_POOL_MAX,
+    )
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+
+
+# 日报：每个 UTC 自然日最多自动发送一次（进程重启后仍可读此文件避免当天重复）
+DAILY_REPORT_LAST_SENT_FILE = os.path.join(log_dir, "daily_report_last_sent_date.txt")
+
+
+def _daily_report_load_last_sent_date() -> Optional[date]:
+    try:
+        if os.path.exists(DAILY_REPORT_LAST_SENT_FILE):
+            with open(DAILY_REPORT_LAST_SENT_FILE, 'r', encoding='utf-8') as f:
+                s = f.read().strip()
+            if s:
+                return date.fromisoformat(s)
+    except Exception:
+        pass
+    return None
+
+
+def _daily_report_save_last_sent_date(d: date) -> None:
+    try:
+        with open(DAILY_REPORT_LAST_SENT_FILE, 'w', encoding='utf-8') as f:
+            f.write(d.isoformat())
+    except Exception as e:
+        logging.warning(f"⚠️ 写入日报日期标记失败: {e}")
+
+
+def _seconds_sleep_until_after_next_utc_midnight(now: datetime) -> float:
+    """休眠到下一 UTC 日 00:00 之后再过 120 秒，避免边界上重复触发。"""
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_midnight = start + timedelta(days=1)
+    return max(60.0, (next_midnight - now).total_seconds() + 120.0)
+
+
 # 数据库路径
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_INI_PATH = os.path.join(SCRIPT_DIR, "config.ini")
 
 # 持仓记录文件
 POSITIONS_RECORD_FILE = os.path.join(SCRIPT_DIR, "positions_record.json")
+
+# 交易历史记录文件
+TRADE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "trade_history.json")
+
+# 信号历史记录文件
+SIGNAL_HISTORY_FILE = os.path.join(SCRIPT_DIR, "signal_history.json")
+_signal_history_lock = __import__('threading').Lock()
 
 # 币安 U 本位合约：算法单 orderType（与 futures_get_open_algo_orders 一致）
 FUTURES_ALGO_TP_TYPES = frozenset({
@@ -185,72 +263,94 @@ def generate_daily_report() -> str:
                 report_lines.append(f"❌ 获取账户信息失败: {e}")
             report_lines.append("")
 
-            # 2. 持仓情况
+            cutoff_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+
+            # 2. 当前持仓（原「摘要 + 详情」合并为一节，避免重复）
             report_lines.append("📈 当前持仓")
             report_lines.append("-" * 30)
             try:
                 if strategy and strategy.positions:
                     for pos in strategy.positions:
                         direction = "多头" if pos.get('direction') == 'long' else "空头"
+                        symbol = pos.get('symbol', 'Unknown')
+                        entry_time_str = pos.get('entry_time', 'Unknown')
+                        raw_ep = pos.get('entry_price')
+                        quantity = abs(pos.get('quantity', 0))
 
-                        # 实时计算当前盈亏
+                        current_price = None
+                        pnl_display = "—"
+                        pnl_color = "⚪"
+
                         try:
-                            ticker = strategy.client.futures_symbol_ticker(symbol=pos['symbol'])
-                            current_price = float(ticker['price'])
-                            entry_price = pos['entry_price']
-                            quantity = abs(pos.get('quantity', 0))
+                            entry_disp = f"${float(raw_ep):.6f}"
+                        except (TypeError, ValueError):
+                            entry_disp = str(raw_ep) if raw_ep is not None else "—"
 
+                        try:
+                            ep = float(raw_ep)
+                            if ep == 0:
+                                raise ValueError("entry_price 为 0")
+                            tk = strategy.client.futures_symbol_ticker(symbol=symbol)
+                            current_price = float(tk['price'])
                             if pos.get('direction') == 'long':
-                                pnl_pct = (current_price - entry_price) / entry_price
+                                pnl_pct = (current_price - ep) / ep
                             else:
-                                pnl_pct = (entry_price - current_price) / entry_price
-
-                            position_value = quantity * entry_price
+                                pnl_pct = (ep - current_price) / ep
+                            position_value = quantity * ep
                             pnl_value = pnl_pct * position_value * strategy.leverage
                             pnl_display = f"${pnl_value:.2f} ({pnl_pct*100:.2f}%)"
+                            if pnl_value > 0:
+                                pnl_color = "🟢"
+                            elif pnl_value < 0:
+                                pnl_color = "🔴"
+                            else:
+                                pnl_color = "⚪"
                         except Exception as e:
                             pnl_display = f"计算失败: {e}"
 
-                        pnl_color = "🟢" if pnl_value > 0 else "🔴"
-                        report_lines.append(f"{pos['symbol']}: {direction} | "
-                                          f"数量:{quantity:.0f} | "
-                                          f"价格:${entry_price:.6f} | "
-                                          f"{pnl_color}盈亏:{pnl_display}")
+                        price_line = f"${current_price:.6f}" if current_price is not None else "获取失败"
+                        report_lines.append(f"{pnl_color} {symbol} · {direction}")
+                        report_lines.append(f"  建仓时间: {entry_time_str}")
+                        report_lines.append(f"  建仓价格: {entry_disp}")
+                        report_lines.append(f"  持仓数量: {quantity:.0f}")
+                        report_lines.append(f"  当前价格: {price_line}")
+                        report_lines.append(f"  当前盈亏: {pnl_display}")
+                        report_lines.append("")
                 else:
                     report_lines.append("无持仓")
             except Exception as e:
                 report_lines.append(f"❌ 获取持仓信息失败: {e}")
             report_lines.append("")
 
-            # 3. 过去24小时统计
-            report_lines.append("📊 过去24小时统计")
+            # 3. 过去24小时统计（与第6节均为 REALIZED_PNL 口径）
+            report_lines.append("📊 过去24小时统计（币安 REALIZED_PNL 资金流水）")
             report_lines.append("-" * 30)
             try:
-                # 获取24小时前的收入记录
-                yesterday = datetime.now(timezone.utc) - timedelta(hours=24)
-                start_timestamp = int(yesterday.timestamp() * 1000)
+                start_timestamp = int(cutoff_24h.timestamp() * 1000)
 
                 income_history = strategy.client.futures_income_history(
                     startTime=start_timestamp,
-                    incomeType='REALIZED_PNL'
+                    incomeType='REALIZED_PNL',
                 )
 
                 if income_history:
                     total_24h_pnl = sum(float(record['income']) for record in income_history)
-                    trade_count = len(income_history)
+                    n = len(income_history)
 
-                    report_lines.append(f"已实现盈亏: ${total_24h_pnl:.2f}")
-                    report_lines.append(f"交易次数: {trade_count}")
+                    report_lines.append(f"已实现盈亏合计: ${total_24h_pnl:.2f}")
+                    report_lines.append(f"流水条数: {n}（平仓分批等会产生多条，不等于策略开平仓次数）")
 
-                    # 统计盈利/亏损次数
-                    profitable_trades = len([r for r in income_history if float(r['income']) > 0])
-                    loss_trades = len([r for r in income_history if float(r['income']) <= 0])
+                    profitable = len([r for r in income_history if float(r['income']) > 0])
+                    non_positive = len([r for r in income_history if float(r['income']) <= 0])
 
-                    report_lines.append(f"盈利交易: {profitable_trades}")
-                    report_lines.append(f"亏损交易: {loss_trades}")
-                    report_lines.append(f"胜率: {profitable_trades/trade_count*100:.1f}%" if trade_count > 0 else "胜率: 0%")
+                    report_lines.append(f"盈利条数: {profitable}")
+                    report_lines.append(f"非盈利条数: {non_positive}")
+                    report_lines.append(
+                        f"流水维度胜率: {profitable/n*100:.1f}%（盈利条数/总条数，非策略胜率）"
+                        if n > 0 else "流水维度胜率: —"
+                    )
                 else:
-                    report_lines.append("过去24小时无交易记录")
+                    report_lines.append("过去24小时无 REALIZED_PNL 流水")
             except Exception as e:
                 report_lines.append(f"❌ 获取交易统计失败: {e}")
             report_lines.append("")
@@ -272,8 +372,10 @@ def generate_daily_report() -> str:
                             try:
                                 # 解析时间
                                 time_str = line.split('时间:')[1].strip()
-                                log_time = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S UTC')
-                                if log_time > yesterday:
+                                log_time = datetime.strptime(
+                                    time_str, '%Y-%m-%d %H:%M:%S UTC'
+                                ).replace(tzinfo=timezone.utc)
+                                if log_time > cutoff_24h:
                                     recent_changes.append(line.strip())
                             except Exception:
                                 continue
@@ -301,88 +403,43 @@ def generate_daily_report() -> str:
             except Exception as e:
                 report_lines.append(f"❌ 获取系统状态失败: {e}")
 
-            # 6. 详细交易记录
+            # 6. 流水明细（与第3节同口径：仅 REALIZED_PNL）
             report_lines.append("")
-            report_lines.append("📋 详细交易记录")
+            report_lines.append("📋 过去24小时已实现盈亏流水明细（REALIZED_PNL，最多列20条）")
             report_lines.append("-" * 30)
 
             try:
-                # 获取过去24小时的所有交易记录
-                yesterday = datetime.now(timezone.utc) - timedelta(hours=24)
-                start_timestamp = int(yesterday.timestamp() * 1000)
+                start_timestamp = int(cutoff_24h.timestamp() * 1000)
 
-                income_history = strategy.client.futures_income_history(
+                income_detail = strategy.client.futures_income_history(
                     startTime=start_timestamp,
-                    limit=100  # 获取更多记录
+                    incomeType='REALIZED_PNL',
+                    limit=100,
                 )
 
-                if income_history:
-                    report_lines.append(f"共 {len(income_history)} 笔交易:")
+                if income_detail:
+                    report_lines.append(f"共 {len(income_detail)} 条流水，下列显示前 20 条:")
                     report_lines.append("")
 
-                    for i, record in enumerate(income_history[:20], 1):  # 最多显示20笔
+                    for i, record in enumerate(income_detail[:20], 1):
                         income = float(record['income'])
                         timestamp = datetime.fromtimestamp(record['time'] / 1000, tz=timezone.utc)
                         symbol = record.get('symbol', 'Unknown')
-                        income_type = record.get('incomeType', 'Unknown')
+                        income_type = record.get('incomeType', 'REALIZED_PNL')
 
                         pnl_str = f"+${income:.2f}" if income > 0 else f"${income:.2f}"
                         color = "🟢" if income > 0 else "🔴"
 
-                        report_lines.append(f"{i:2d}. {symbol} | {timestamp.strftime('%m-%d %H:%M')} | "
+                        report_lines.append(f"{i:2d}. {symbol} | {timestamp.strftime('%m-%d %H:%M')} UTC | "
                                           f"{income_type} | {color}{pnl_str}")
 
-                    if len(income_history) > 20:
-                        report_lines.append(f"... 还有 {len(income_history) - 20} 笔交易")
+                    if len(income_detail) > 20:
+                        report_lines.append(f"... 另有 {len(income_detail) - 20} 条流水未列出")
                 else:
-                    report_lines.append("过去24小时无交易记录")
+                    report_lines.append("过去24小时无 REALIZED_PNL 流水")
 
             except Exception as e:
-                report_lines.append(f"❌ 获取交易记录失败: {e}")
-
-            # 7. 持仓详细信息
-            report_lines.append("")
-            report_lines.append("📊 当前持仓详情")
-            report_lines.append("-" * 30)
-
-            try:
-                if strategy and strategy.positions:
-                    for pos in strategy.positions:
-                        direction = "多头" if pos.get('direction') == 'long' else "空头"
-                        entry_time_str = pos.get('entry_time', 'Unknown')
-                        entry_price = pos.get('entry_price', 'Unknown')
-                        quantity = abs(pos.get('quantity', 0))
-                        symbol = pos.get('symbol', 'Unknown')
-
-                        # 计算当前盈亏
-                        try:
-                            ticker = strategy.client.futures_symbol_ticker(symbol=symbol)
-                            current_price = float(ticker['price'])
-
-                            if direction == '多头':
-                                pnl_pct = (current_price - entry_price) / entry_price
-                            else:
-                                pnl_pct = (entry_price - current_price) / entry_price
-
-                            position_value = quantity * entry_price
-                            pnl_value = pnl_pct * position_value * strategy.leverage
-                            pnl_display = f"${pnl_value:.2f} ({pnl_pct*100:.2f}%)"
-                        except Exception as e:
-                            pnl_display = f"计算失败: {e}"
-
-                        report_lines.append(f"交易对: {symbol}")
-                        report_lines.append(f"  方向: {direction}")
-                        report_lines.append(f"  建仓时间: {entry_time_str}")
-                        report_lines.append(f"  建仓价格: ${entry_price}")
-                        report_lines.append(f"  持仓数量: {quantity:.0f}")
-                        report_lines.append(f"  当前价格: ${current_price:.6f}" if 'current_price' in locals() else "  当前价格: 获取失败")
-                        report_lines.append(f"  当前盈亏: {pnl_display}")
-                        report_lines.append("")
-                else:
-                    report_lines.append("当前无持仓")
-
-            except Exception as e:
-                report_lines.append(f"❌ 获取持仓详情失败: {e}")
+                report_lines.append(f"❌ 获取流水明细失败: {e}")
 
         report_lines.append("")
         report_lines.append("---")
@@ -394,8 +451,8 @@ def generate_daily_report() -> str:
     except Exception as e:
         return f"生成报告失败: {e}"
 
-def send_daily_report():
-    """发送每日交易报告邮件"""
+def send_daily_report() -> bool:
+    """生成并保存日报，尝试发邮件。报告文件成功写入则返回 True 并标记本 UTC 日已发送。"""
     try:
         report_content = generate_daily_report()
 
@@ -405,6 +462,8 @@ def send_daily_report():
 
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(report_content)
+
+        _daily_report_save_last_sent_date(datetime.now(timezone.utc).date())
 
         # 发送邮件
         subject = f"每日交易报告 - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
@@ -432,7 +491,7 @@ def send_daily_report():
 
         if not sender_email or not sender_password:
             logging.error("❌ 未配置邮件发送账号")
-            return
+            return True
 
         server = smtplib.SMTP_SSL('smtp.163.com', 465)
         server.login(sender_email, sender_password)
@@ -440,10 +499,11 @@ def send_daily_report():
         server.quit()
 
         logging.info(f"✅ 每日交易报告已发送到 {ALERT_EMAIL}")
-        print(f"✅ 每日交易报告已发送到 {ALERT_EMAIL}")
+        return True
 
     except Exception as e:
         logging.error(f"❌ 发送每日报告失败: {e}")
+        return False
 
 def send_email_alert(subject: str, message: str):
     """发送邮件报警"""
@@ -544,6 +604,21 @@ class YesterdayDataCache:
             logging.error(f"❌ 获取 {symbol} 昨日数据失败: {e}")
             return None
 
+    def prefetch_all(self, symbols: list):
+        """扫描前并发预热所有 symbol 的昨日数据，避免扫描主循环中逐个发 API 请求"""
+        missing = [s for s in symbols if s not in self.cache]
+        if not missing:
+            return
+        logging.info(f"📦 开始并发预热昨日缓存，共 {len(missing)} 个交易对...")
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(self.get_yesterday_avg_sell_api, s): s for s in missing}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    pass
+        logging.info(f"📦 昨日缓存预热完成")
+
 
 # 备用交易对列表（API获取失败时使用）
 BACKUP_SYMBOL_LIST = [
@@ -559,16 +634,360 @@ BACKUP_SYMBOL_LIST = [
 def load_config():
     """从配置文件加载配置；若无文件则使用空段（仅界面模式 + 代码内 fallback 参数）。"""
     config = configparser.ConfigParser()
-    config_file = os.path.join(SCRIPT_DIR, "config.ini")
-    
-    if not os.path.exists(config_file):
+    if not os.path.exists(CONFIG_INI_PATH):
         logging.warning("⚠️ 未找到 config.ini，使用内存默认段（可无密钥仅浏览界面；交易前请创建 config.ini）")
         for sec in ('BINANCE', 'STRATEGY', 'SIGNAL', 'RISK'):
             config[sec] = {}
         return config
-    
-    config.read(config_file, encoding='utf-8')
+    config.read(CONFIG_INI_PATH, encoding='utf-8')
     return config
+
+
+# —— Web「参数编辑」可读写的 config.ini 键（不含 BINANCE）——
+_CONFIG_EDITABLE_KEYS: Dict[str, Tuple[str, ...]] = {
+    'STRATEGY': (
+        'leverage', 'position_size_ratio', 'max_positions', 'max_daily_entries',
+        'enable_hourly_entry_limit', 'max_opens_per_scan',
+    ),
+    'SIGNAL': ('sell_surge_threshold', 'sell_surge_max'),
+    'RISK': (
+        'strong_coin_tp_pct', 'medium_coin_tp_pct', 'weak_coin_tp_pct', 'stop_loss_pct',
+        'enable_max_gain_24h_exit', 'max_gain_24h_threshold', 'max_hold_hours',
+    ),
+}
+
+
+def _config_editable_defaults_strings() -> Dict[str, Dict[str, str]]:
+    """与 AutoExchangeStrategy.__init__ 的 fallback 对齐（字符串形式写入 ini）。"""
+    return {
+        'STRATEGY': {
+            'leverage': '3',
+            'position_size_ratio': '0.09',
+            'max_positions': '10',
+            'max_daily_entries': '6',
+            'enable_hourly_entry_limit': 'false',
+            'max_opens_per_scan': '0',
+        },
+        'SIGNAL': {
+            'sell_surge_threshold': '10',
+            'sell_surge_max': '14008',
+        },
+        'RISK': {
+            'strong_coin_tp_pct': '33',
+            'medium_coin_tp_pct': '21',
+            'weak_coin_tp_pct': '10',
+            'stop_loss_pct': '18',
+            'enable_max_gain_24h_exit': 'false',
+            'max_gain_24h_threshold': '6.3',
+            'max_hold_hours': '72',
+        },
+    }
+
+
+def _get_config_editable_dict() -> Dict[str, Dict[str, str]]:
+    cfg = load_config()
+    defaults = _config_editable_defaults_strings()
+    out: Dict[str, Dict[str, str]] = {}
+    for sec, keys in _CONFIG_EDITABLE_KEYS.items():
+        out[sec] = {}
+        for k in keys:
+            if cfg.has_section(sec) and cfg.has_option(sec, k):
+                out[sec][k] = (cfg.get(sec, k, fallback='') or '').strip()
+            else:
+                out[sec][k] = defaults[sec][k]
+    return out
+
+
+def _parse_bool_incoming(v) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ('true', '1', 'yes', 'on'):
+        return True
+    if s in ('false', '0', 'no', 'off'):
+        return False
+    return None
+
+
+def _merge_editable_post(body: dict) -> Dict[str, Dict[str, str]]:
+    base = _get_config_editable_dict()
+    merged: Dict[str, Dict[str, str]] = {}
+    for sec, keys in _CONFIG_EDITABLE_KEYS.items():
+        inc = body.get(sec)
+        if not isinstance(inc, dict):
+            inc = {}
+        row = dict(base[sec])
+        for k in keys:
+            if k in inc:
+                row[k] = inc[k]
+        merged[sec] = row
+    return merged
+
+
+def _validate_editable_merged(merged: Dict[str, Dict[str, str]]) -> Tuple[Optional[Dict[str, Dict[str, str]]], Optional[str]]:
+    """返回写入 ini 的规范化字符串表，或 (None, 错误信息)。"""
+    out: Dict[str, Dict[str, str]] = {}
+    try:
+        st = merged['STRATEGY']
+        lev = float(st['leverage'])
+        if not (1 <= lev <= 125):
+            return None, '杠杆 leverage 应在 1–125'
+        psr = float(st['position_size_ratio'])
+        if not (0 < psr <= 1):
+            return None, '单仓比例 position_size_ratio 应在 (0, 1]'
+        mp = int(float(st['max_positions']))
+        mde = int(float(st['max_daily_entries']))
+        mos = int(float(st['max_opens_per_scan']))
+        if mp < 1 or mp > 500:
+            return None, 'max_positions 应在 1–500'
+        if mde < 0 or mde > 500:
+            return None, 'max_daily_entries 应在 0–500'
+        if mos < 0 or mos > 500:
+            return None, 'max_opens_per_scan 应在 0–500'
+        eh = _parse_bool_incoming(st['enable_hourly_entry_limit'])
+        if eh is None:
+            return None, 'enable_hourly_entry_limit 应为 true/false'
+        out['STRATEGY'] = {
+            'leverage': str(int(lev)) if lev == int(lev) else str(lev),
+            'position_size_ratio': str(psr),
+            'max_positions': str(mp),
+            'max_daily_entries': str(mde),
+            'enable_hourly_entry_limit': 'true' if eh else 'false',
+            'max_opens_per_scan': str(mos),
+        }
+
+        sg = merged['SIGNAL']
+        sst = float(sg['sell_surge_threshold'])
+        ssm = float(sg['sell_surge_max'])
+        if sst <= 0 or ssm <= 0:
+            return None, '卖量阈值须为正数'
+        if ssm <= sst:
+            return None, 'sell_surge_max 须大于 sell_surge_threshold'
+        out['SIGNAL'] = {
+            'sell_surge_threshold': str(sst),
+            'sell_surge_max': str(ssm),
+        }
+
+        rk = merged['RISK']
+        for key in ('strong_coin_tp_pct', 'medium_coin_tp_pct', 'weak_coin_tp_pct', 'stop_loss_pct'):
+            x = float(rk[key])
+            if not (0.1 <= x <= 99):
+                return None, f'{key} 应在 0.1–99'
+        mg = _parse_bool_incoming(rk['enable_max_gain_24h_exit'])
+        if mg is None:
+            return None, 'enable_max_gain_24h_exit 应为 true/false'
+        mgt = float(rk['max_gain_24h_threshold'])
+        if not (0.01 <= mgt <= 100):
+            return None, 'max_gain_24h_threshold（百分比）应在 0.01–100'
+        mhh = float(rk['max_hold_hours'])
+        if not (1 <= mhh <= 720):
+            return None, 'max_hold_hours 应在 1–720'
+        out['RISK'] = {
+            'strong_coin_tp_pct': str(float(rk['strong_coin_tp_pct'])),
+            'medium_coin_tp_pct': str(float(rk['medium_coin_tp_pct'])),
+            'weak_coin_tp_pct': str(float(rk['weak_coin_tp_pct'])),
+            'stop_loss_pct': str(float(rk['stop_loss_pct'])),
+            'enable_max_gain_24h_exit': 'true' if mg else 'false',
+            'max_gain_24h_threshold': str(mgt),
+            'max_hold_hours': str(int(mhh)) if mhh == int(mhh) else str(mhh),
+        }
+    except (TypeError, ValueError, KeyError) as e:
+        return None, f'参数格式无效: {e}'
+    return out, None
+
+
+def _atomic_write_config_ini(parser: configparser.ConfigParser) -> None:
+    fd, tmp_path = tempfile.mkstemp(suffix='.ini', prefix='ae_config_', dir=SCRIPT_DIR, text=True)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            parser.write(f)
+        os.replace(tmp_path, CONFIG_INI_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# 热更新运行中 strategy 的可编辑段时，批量写属性避免与扫描/监控线程交错读到半成品
+_STRATEGY_CONFIG_LOCK = threading.Lock()
+
+
+def _apply_normalized_editable_to_strategy(s: 'AutoExchangeStrategy', norm: Dict[str, Dict[str, str]]) -> None:
+    """将已通过校验的 STRATEGY/SIGNAL/RISK 字符串表写回策略实例（与 __init__ 解析一致）。"""
+    cp = configparser.ConfigParser()
+    for sec, kv in norm.items():
+        if not cp.has_section(sec):
+            cp.add_section(sec)
+        for k, v in kv.items():
+            cp.set(sec, k, v)
+
+    s.leverage = cp.getfloat('STRATEGY', 'leverage')
+    s.position_size_ratio = cp.getfloat('STRATEGY', 'position_size_ratio')
+    s.max_positions = cp.getint('STRATEGY', 'max_positions')
+    s.max_daily_entries = cp.getint('STRATEGY', 'max_daily_entries')
+    s.enable_hourly_entry_limit = cp.getboolean('STRATEGY', 'enable_hourly_entry_limit')
+    s.max_opens_per_scan = cp.getint('STRATEGY', 'max_opens_per_scan')
+
+    s.sell_surge_threshold = cp.getfloat('SIGNAL', 'sell_surge_threshold')
+    s.sell_surge_max = cp.getfloat('SIGNAL', 'sell_surge_max')
+
+    s.strong_coin_tp_pct = cp.getfloat('RISK', 'strong_coin_tp_pct')
+    s.medium_coin_tp_pct = cp.getfloat('RISK', 'medium_coin_tp_pct')
+    s.weak_coin_tp_pct = cp.getfloat('RISK', 'weak_coin_tp_pct')
+    s.stop_loss_pct = cp.getfloat('RISK', 'stop_loss_pct')
+    s.enable_max_gain_24h_exit = cp.getboolean('RISK', 'enable_max_gain_24h_exit')
+    s.max_gain_24h_threshold = cp.getfloat('RISK', 'max_gain_24h_threshold') / 100.0
+    s.max_hold_hours = cp.getfloat('RISK', 'max_hold_hours')
+
+    cfg = getattr(s, 'config', None)
+    if cfg is not None:
+        try:
+            for sec, kv in norm.items():
+                if not cfg.has_section(sec):
+                    cfg.add_section(sec)
+                for k, v in kv.items():
+                    cfg.set(sec, k, v)
+        except Exception:
+            pass
+
+
+def _strip_cred_plain(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _resolve_binance_keys_for_effective_trading(cfg: Optional[configparser.ConfigParser] = None) -> Tuple[Optional[str], Optional[str], str]:
+    """与策略一致：环境变量优先，否则 config.ini [BINANCE]。返回 (key, secret, 'env'|'file'|'none')。"""
+    if cfg is None:
+        cfg = load_config()
+    k = _strip_cred_plain(os.getenv('BINANCE_API_KEY'))
+    s = _strip_cred_plain(os.getenv('BINANCE_API_SECRET'))
+    if k and s:
+        return k, s, 'env'
+    try:
+        if cfg.has_section('BINANCE'):
+            ik = _strip_cred_plain(cfg.get('BINANCE', 'api_key', fallback=''))
+            isec = _strip_cred_plain(cfg.get('BINANCE', 'api_secret', fallback=''))
+            if ik and isec:
+                return ik, isec, 'file'
+    except Exception:
+        pass
+    return None, None, 'none'
+
+
+def _file_binance_keys(cfg: configparser.ConfigParser) -> Tuple[Optional[str], Optional[str]]:
+    if not cfg.has_section('BINANCE'):
+        return None, None
+    return (
+        _strip_cred_plain(cfg.get('BINANCE', 'api_key', fallback='')),
+        _strip_cred_plain(cfg.get('BINANCE', 'api_secret', fallback='')),
+    )
+
+
+def _key_tail_4(k: Optional[str]) -> str:
+    if not k or len(k) < 4:
+        return ''
+    return k[-4:]
+
+
+def _create_binance_client(api_key: str, api_secret: str) -> Client:
+    """创建 U 本位期货 Client（与 AutoExchangeStrategy.__init__ 逻辑一致，含现货 ping 绕过）。"""
+    last_error: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            try:
+                c = Client(api_key, api_secret, tld='com', testnet=False, ping=False)
+            except TypeError:
+                c = Client(api_key, api_secret, tld='com', testnet=False)
+            c.FUTURES_RECV_WINDOW = 10000
+            return c
+        except Exception as e:
+            last_error = e
+            error_msg = str(e)
+            if 'SSL' in error_msg or 'ping' in error_msg or 'api.binance.com' in error_msg:
+                try:
+                    raw = object.__new__(Client)
+                    try:
+                        Client.__init__(
+                            raw,
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            tld='com',
+                            testnet=False,
+                            ping=False,
+                        )
+                    except TypeError:
+                        Client.__init__(
+                            raw,
+                            api_key,
+                            api_secret,
+                            tld='com',
+                            testnet=False,
+                        )
+                    raw.FUTURES_RECV_WINDOW = 10000
+                    return raw
+                except Exception as bypass_error:
+                    last_error = bypass_error
+                    if attempt < 2:
+                        logging.warning(f"⚠️ Binance Client 尝试 {attempt+1}/3 失败，2秒后重试...")
+                        time.sleep(2)
+                        continue
+                    raise bypass_error
+            else:
+                if attempt < 2:
+                    logging.warning(f"⚠️ Binance Client 尝试 {attempt+1}/3 失败: {error_msg[:80]}")
+                    time.sleep(2)
+                    continue
+                raise
+    if last_error:
+        raise last_error
+    raise RuntimeError('无法创建币安客户端')
+
+
+def _sync_strategy_config_binance_from_parser(strategy_obj: 'AutoExchangeStrategy', parser: configparser.ConfigParser) -> None:
+    cfg = getattr(strategy_obj, 'config', None)
+    if cfg is None or not parser.has_section('BINANCE'):
+        return
+    try:
+        if not cfg.has_section('BINANCE'):
+            cfg.add_section('BINANCE')
+        for opt in ('api_key', 'api_secret'):
+            if parser.has_option('BINANCE', opt):
+                cfg.set('BINANCE', opt, parser.get('BINANCE', opt))
+    except Exception:
+        pass
+
+
+def _reinit_strategy_binance_client_after_ini_change() -> Tuple[bool, str]:
+    """写入 config.ini 后按「环境变量优先」规则重建 strategy 的 client。返回 (ok, message)。"""
+    global strategy
+    if strategy is None:
+        return True, 'strategy 未初始化，下次启动将读取新密钥'
+    cfg = load_config()
+    k, s, src = _resolve_binance_keys_for_effective_trading(cfg)
+    with _STRATEGY_CONFIG_LOCK:
+        if not k or not s:
+            strategy.api_configured = False
+            strategy.client = None
+            strategy.yesterday_cache = YesterdayDataCache(None)
+            _sync_strategy_config_binance_from_parser(strategy, cfg)
+            return True, '已清除运行中的 API 客户端（当前无有效密钥）'
+        try:
+            cl = _create_binance_client(k, s)
+            _configure_binance_http_adapter(getattr(cl, 'session', None))
+            cl.futures_ping()
+        except Exception as e:
+            return False, str(e)
+        strategy.client = cl
+        strategy.api_configured = True
+        strategy.yesterday_cache = YesterdayDataCache(cl)
+        _sync_strategy_config_binance_from_parser(strategy, cfg)
+    logging.info('✅ Binance 客户端已按当前配置热重载（来源=%s）', src)
+    return True, ''
 
 
 class AutoExchangeStrategy:
@@ -615,7 +1034,13 @@ class AutoExchangeStrategy:
             client_ready = False
             for attempt in range(3):
                 try:
-                    self.client = Client(api_key, api_secret, tld='com', testnet=False)
+                    # ping=False：跳过构造函数内对现货 api 的 ping（策略只用期货；避免失败后走不完整 bypass）
+                    try:
+                        self.client = Client(
+                            api_key, api_secret, tld='com', testnet=False, ping=False
+                        )
+                    except TypeError:
+                        self.client = Client(api_key, api_secret, tld='com', testnet=False)
                     self.client.FUTURES_RECV_WINDOW = 10000
                     client_ready = True
                     break
@@ -624,18 +1049,29 @@ class AutoExchangeStrategy:
                     if 'SSL' in error_msg or 'ping' in error_msg or 'api.binance.com' in error_msg:
                         logging.warning(f"⚠️ 现货API连接失败（可忽略，我们只用期货API）: {error_msg[:80]}...")
                         try:
-                            self.client = object.__new__(Client)
-                            self.client.API_KEY = api_key
-                            self.client.API_SECRET = api_secret
+                            # 必须跑 Client.__init__ / BaseClient.__init__，否则无 testnet、tld、FUTURES_URL 等实例属性
+                            raw = object.__new__(Client)
+                            try:
+                                Client.__init__(
+                                    raw,
+                                    api_key=api_key,
+                                    api_secret=api_secret,
+                                    tld='com',
+                                    testnet=False,
+                                    ping=False,
+                                )
+                            except TypeError:
+                                Client.__init__(
+                                    raw,
+                                    api_key=api_key,
+                                    api_secret=api_secret,
+                                    tld='com',
+                                    testnet=False,
+                                )
+                            self.client = raw
                             self.client.FUTURES_RECV_WINDOW = 10000
-                            self.client.session = requests.Session()
-                            self.client.session.headers.update({
-                                'Accept': 'application/json',
-                                'User-Agent': 'Mozilla/5.0',
-                                'X-MBX-APIKEY': api_key
-                            })
                             client_ready = True
-                            logging.info("✅ 已绕过现货API测试，创建期货专用客户端")
+                            logging.info("✅ 已绕过现货 ping，完成 Client 初始化（testnet=False，主网期货）")
                             break
                         except Exception as bypass_error:
                             if attempt < 2:
@@ -653,6 +1089,8 @@ class AutoExchangeStrategy:
 
             if not client_ready:
                 raise RuntimeError("无法创建币安客户端")
+
+            _configure_binance_http_adapter(getattr(self.client, 'session', None))
 
             try:
                 self.client.futures_ping()
@@ -737,8 +1175,16 @@ class AutoExchangeStrategy:
         self._positions_sync_lock = threading.RLock()  # 保护 positions 与 positions_record 同步
         self._entry_global_lock = threading.Lock()  # 建仓全局限流：检查持仓上限与下单原子化
         
-        # 账户余额
+        # 账户余额（与币安 futures_account 顶部字段一致）
         self.account_balance = 0.0
+        self.account_available_balance = 0.0
+
+        # exchange_info 缓存（避免每次建仓都调用重量级接口）
+        self._exchange_info_cache: Dict[str, dict] = {}   # {symbol: symbol_info}
+        self._exchange_info_updated_at: Optional[datetime] = None
+
+        # intraday_buy_surge_ratio 缓存，key=(symbol, hour_str)，每小时自动失效
+        self._intraday_ratio_cache: Dict[tuple, float] = {}
         
         # 加载现有持仓
         self.server_load_existing_positions()
@@ -791,6 +1237,7 @@ class AutoExchangeStrategy:
             if removed:
                 self.server_save_positions_record()
                 logging.info(f"💾 已保存持仓记录（本次移除幽灵仓 {removed} 条）")
+                notify_positions_changed()
         return removed
     
     def server_load_existing_positions(self):
@@ -936,7 +1383,18 @@ class AutoExchangeStrategy:
                 logging.info(f"🎉 成功加载 {loaded_count} 个现有持仓")
             else:
                 logging.info("📭 无现有持仓")
-                
+
+            # 重启后从当前持仓恢复今日建仓计数
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            today_count = sum(
+                1 for p in self.positions
+                if p.get('entry_time', '').startswith(today)
+            )
+            if today_count > 0:
+                self.daily_entries = today_count
+                self.last_entry_date = today
+                logging.info(f"📅 恢复今日建仓计数: {today_count}")
+
         except Exception as e:
             logging.error(f"❌ 加载现有持仓失败: {e}")
     
@@ -1161,6 +1619,12 @@ class AutoExchangeStrategy:
             # 解析信号时间
             signal_dt = datetime.strptime(signal_datetime, '%Y-%m-%d %H:%M:%S UTC').replace(tzinfo=timezone.utc)
 
+            # 以 (symbol, 小时) 为 key 做缓存，同一小时内重复计算直接返回
+            cache_key = (symbol, signal_dt.strftime('%Y-%m-%d %H'))
+            if cache_key in self._intraday_ratio_cache:
+                logging.debug(f"📊 {symbol} 当日买量倍数命中缓存: {self._intraday_ratio_cache[cache_key]:.2f}倍")
+                return self._intraday_ratio_cache[cache_key]
+
             # 计算时间范围：信号前12小时
             start_time = signal_dt - timedelta(hours=12)
             end_time = signal_dt
@@ -1198,6 +1662,15 @@ class AutoExchangeStrategy:
             else:
                 logging.debug(f"⚠️ {symbol} 未计算出有效的当日买量倍数（max_ratio=0）")
 
+            # 写入缓存，同一小时内重复调用直接命中
+            self._intraday_ratio_cache[cache_key] = max_ratio
+            # 防止缓存无限增长，超过 500 条时清空过期条目
+            if len(self._intraday_ratio_cache) > 500:
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+                cutoff_str = cutoff.strftime('%Y-%m-%d %H')
+                self._intraday_ratio_cache = {
+                    k: v for k, v in self._intraday_ratio_cache.items() if k[1] >= cutoff_str
+                }
             return max_ratio
 
         except Exception as e:
@@ -1219,6 +1692,19 @@ class AutoExchangeStrategy:
         except Exception as e:
             logging.error(f"❌ 获取账户余额失败: {e}")
             return 0.0
+
+    def server_sync_wallet_snapshot(self) -> bool:
+        """从 futures_account 同步总钱包与可开仓余额（一次请求，不含今日盈亏等重逻辑）。"""
+        if not getattr(self, 'api_configured', False) or self.client is None:
+            return False
+        try:
+            acc = self.client.futures_account()
+            self.account_balance = float(acc['totalWalletBalance'])
+            self.account_available_balance = float(acc['availableBalance'])
+            return True
+        except Exception as e:
+            logging.warning(f"⚠️ 同步钱包快照失败（futures_account）: {e}")
+            return False
     
     def server_get_account_info(self) -> Optional[Dict]:
         """获取账户详细信息（余额、可用余额、未实现盈亏、今日盈亏）- 服务器版本"""
@@ -1320,24 +1806,45 @@ class AutoExchangeStrategy:
             return 0.0
     
     def _server_get_active_symbols(self) -> List[str]:
-        """获取活跃交易对列表（API方式）- 服务器版本"""
+        """获取活跃交易对列表（API方式）- 服务器版本，同时更新 exchange_info 缓存"""
         try:
             # 获取所有U本位期货交易对
             exchange_info = self.client.futures_exchange_info()
+
+            # 顺带更新 exchange_info 缓存，供 _get_symbol_info() 使用（避免建仓时重复调用）
+            self._exchange_info_cache = {s['symbol']: s for s in exchange_info['symbols']}
+            self._exchange_info_updated_at = datetime.now(timezone.utc)
+
             symbols = []
-            
             for s in exchange_info['symbols']:
                 symbol = s['symbol']
                 # 只筛选USDT永续合约，并且状态为TRADING
                 if symbol.endswith('USDT') and s['status'] == 'TRADING' and s['contractType'] == 'PERPETUAL':
                     symbols.append(symbol)
-            
-            logging.info(f"✅ 获取到 {len(symbols)} 个活跃USDT合约")
+
+            logging.info(f"✅ 获取到 {len(symbols)} 个活跃USDT合约，exchange_info 缓存已更新")
             return sorted(symbols)
-        
+
         except Exception as e:
             logging.error(f"❌ 获取交易对列表失败: {e}，使用备用列表")
             return BACKUP_SYMBOL_LIST
+
+    def _get_symbol_info(self, symbol: str) -> Optional[dict]:
+        """获取单个交易对的 exchange_info（优先读本地缓存，过期则重新拉取）"""
+        now = datetime.now(timezone.utc)
+        cache_expired = (
+            self._exchange_info_updated_at is None or
+            (now - self._exchange_info_updated_at).total_seconds() > 3600
+        )
+        if cache_expired or symbol not in self._exchange_info_cache:
+            try:
+                info = self.client.futures_exchange_info()
+                self._exchange_info_cache = {s['symbol']: s for s in info['symbols']}
+                self._exchange_info_updated_at = now
+                logging.info("🔄 exchange_info 缓存已刷新")
+            except Exception as e:
+                logging.error(f"❌ 刷新 exchange_info 缓存失败: {e}")
+        return self._exchange_info_cache.get(symbol)
     
     def server_scan_sell_surge_signals(self) -> List[Dict]:
         """扫描卖量暴涨信号（API实时版本）- 服务器版本"""
@@ -1349,99 +1856,101 @@ class AutoExchangeStrategy:
             now_utc = datetime.now(timezone.utc)
             current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
             
-            # 获取交易对列表
+            # 获取交易对列表（同时刷新 exchange_info 缓存）
             symbols = self._server_get_active_symbols()
             logging.info(f"📊 开始扫描 {len(symbols)} 个交易对...")
-            
-            # 逐个检查交易对
-            for symbol in symbols:
+
+            # 并发预热昨日数据缓存，避免扫描主循环中逐个发 API 请求
+            self.yesterday_cache.prefetch_all(symbols)
+
+            check_hour = current_hour - timedelta(hours=1)
+            check_hour_ms = int(check_hour.timestamp() * 1000)
+
+            def _scan_one(symbol: str) -> Optional[Dict]:
+                """扫描单个交易对，返回信号 dict 或 None"""
                 try:
-                    # 1. 从缓存获取昨日平均小时卖量
+                    # 1. 从缓存获取昨日平均小时卖量（预热后命中缓存，无网络请求）
                     yesterday_avg_hour_sell = self.yesterday_cache.get_yesterday_avg_sell_api(symbol)
                     if not yesterday_avg_hour_sell or yesterday_avg_hour_sell <= 0:
-                        continue
-                    
+                        return None
+
                     # 2. 获取上一个完整小时的K线（刚刚完成的小时）
-                    check_hour = current_hour - timedelta(hours=1)
-                    check_hour_ms = int(check_hour.timestamp() * 1000)
-                    
-                    # 请求上一小时的K线数据
                     klines = self.client.futures_klines(
                         symbol=symbol,
                         interval='1h',
                         startTime=check_hour_ms,
                         limit=2  # 获取上一小时和当前小时
                     )
-                    
+
                     if not klines or len(klines) < 1:
-                        continue
-                    
+                        return None
+
                     # 上一小时数据
                     hour_kline = klines[0]
                     hour_volume = float(hour_kline[5])  # 总成交量
                     hour_active_buy = float(hour_kline[9])  # 主动买入量
                     hour_sell_volume = hour_volume - hour_active_buy
                     hour_close = float(hour_kline[4])
-                    
+
                     # 计算暴涨倍数
                     surge_ratio = hour_sell_volume / yesterday_avg_hour_sell
-                    
+
                     # 3. 检查是否满足阈值
-                    if self.sell_surge_threshold <= surge_ratio <= self.sell_surge_max:
-                        # 获取信号价格（使用下一小时开盘价，如果存在）
-                        if len(klines) >= 2:
-                            signal_price = float(klines[1][1])  # 下一小时开盘价
-                            logging.info(f"📊 {symbol} 信号价格: 使用下一小时开盘价 {signal_price:.6f}")
-                        else:
-                            signal_price = hour_close
-                            logging.info(f"📊 {symbol} 信号价格: 下一小时未生成，使用当前小时收盘价 {signal_price:.6f}")
+                    if not (self.sell_surge_threshold <= surge_ratio <= self.sell_surge_max):
+                        return None
 
-                        # 🆕 检查当日买量倍数风控
-                        signal_time_utc = datetime.fromtimestamp(int(hour_kline[0]) / 1000, tz=timezone.utc)
-                        signal_time_str = signal_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+                    # 获取信号价格（使用下一小时开盘价，如果存在）
+                    if len(klines) >= 2:
+                        signal_price = float(klines[1][1])  # 下一小时开盘价
+                        logging.info(f"📊 {symbol} 信号价格: 使用下一小时开盘价 {signal_price:.6f}")
+                    else:
+                        signal_price = hour_close
+                        logging.info(f"📊 {symbol} 信号价格: 下一小时未生成，使用当前小时收盘价 {signal_price:.6f}")
 
-                        intraday_buy_ratio = 0.0
-                        if self.enable_intraday_buy_ratio_filter:
-                            try:
-                                intraday_buy_ratio = self.server_calculate_intraday_buy_surge_ratio(symbol, signal_time_str)
-                            except Exception as e:
-                                logging.debug(f"计算当日买量倍数失败 {symbol}: {e}")
+                    # 🆕 检查当日买量倍数风控
+                    signal_time_utc = datetime.fromtimestamp(int(hour_kline[0]) / 1000, tz=timezone.utc)
+                    signal_time_str = signal_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
 
-                        # 🔥 风控：当日买量倍数区间过滤（过滤多空博弈信号）
-                        if intraday_buy_ratio > 0 and self.enable_intraday_buy_ratio_filter:
-                            for danger_min, danger_max in self.intraday_buy_ratio_danger_ranges:
-                                if danger_min <= intraday_buy_ratio <= danger_max:
-                                    logging.warning(f"🚫 {symbol} 当日买量倍数风控过滤信号: {intraday_buy_ratio:.2f}倍在危险区间[{danger_min}, {danger_max}]（卖量暴涨{ surge_ratio:.2f}倍但买量也暴涨，疑似多空博弈信号）")
-                                    break  # 跳过这个信号
-                            else:
-                                # 如果没有在危险区间内，则记录信号
-                                signals.append({
-                                    'symbol': symbol,
-                                    'surge_ratio': surge_ratio,
-                                    'price': signal_price,
-                                    'signal_time': signal_time_str,
-                                    'hour_sell_volume': hour_sell_volume,
-                                    'yesterday_avg': yesterday_avg_hour_sell,
-                                    'intraday_buy_ratio': intraday_buy_ratio  # 🆕 添加买量倍数信息
-                                })
-                                logging.info(f"🔥 发现信号: {symbol} 卖量暴涨 {surge_ratio:.2f}倍 @ {signal_price:.6f} (买量倍数:{intraday_buy_ratio:.2f}倍) (时间: {signal_time_utc.strftime('%Y-%m-%d %H:%M UTC')})")
-                        else:
-                            # 如果不启用买量倍数风控，直接记录信号
-                            signals.append({
-                                'symbol': symbol,
-                                'surge_ratio': surge_ratio,
-                                'price': signal_price,
-                                'signal_time': signal_time_str,
-                                'hour_sell_volume': hour_sell_volume,
-                                'yesterday_avg': yesterday_avg_hour_sell,
-                                'intraday_buy_ratio': intraday_buy_ratio  # 🆕 添加买量倍数信息
-                            })
-                            logging.info(f"🔥 发现信号: {symbol} 卖量暴涨 {surge_ratio:.2f}倍 @ {signal_price:.6f} (买量倍数:{intraday_buy_ratio:.2f}倍) (时间: {signal_time_utc.strftime('%Y-%m-%d %H:%M UTC')})")
-                
+                    intraday_buy_ratio = 0.0
+                    if self.enable_intraday_buy_ratio_filter:
+                        try:
+                            intraday_buy_ratio = self.server_calculate_intraday_buy_surge_ratio(symbol, signal_time_str)
+                        except Exception as e:
+                            logging.debug(f"计算当日买量倍数失败 {symbol}: {e}")
+
+                    # 🔥 风控：当日买量倍数区间过滤（过滤多空博弈信号）
+                    if intraday_buy_ratio > 0 and self.enable_intraday_buy_ratio_filter:
+                        for danger_min, danger_max in self.intraday_buy_ratio_danger_ranges:
+                            if danger_min <= intraday_buy_ratio <= danger_max:
+                                logging.warning(f"🚫 {symbol} 当日买量倍数风控过滤信号: {intraday_buy_ratio:.2f}倍在危险区间[{danger_min}, {danger_max}]（卖量暴涨{surge_ratio:.2f}倍但买量也暴涨，疑似多空博弈信号）")
+                                return None  # 跳过这个信号
+
+                    logging.info(f"🔥 发现信号: {symbol} 卖量暴涨 {surge_ratio:.2f}倍 @ {signal_price:.6f} (买量倍数:{intraday_buy_ratio:.2f}倍) (时间: {signal_time_utc.strftime('%Y-%m-%d %H:%M UTC')})")
+                    return {
+                        'symbol': symbol,
+                        'surge_ratio': surge_ratio,
+                        'price': signal_price,
+                        'signal_time': signal_time_str,
+                        'hour_sell_volume': hour_sell_volume,
+                        'yesterday_avg': yesterday_avg_hour_sell,
+                        'intraday_buy_ratio': intraday_buy_ratio,
+                    }
+
                 except Exception:
                     # 单个交易对失败不影响整体
-                    continue
-            
+                    return None
+
+            # 并发扫描所有交易对（max_workers=20 控制并发，避免触发 Binance 频率限制）
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                futures_map = {executor.submit(_scan_one, sym): sym for sym in symbols}
+                for future in as_completed(futures_map):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            signals.append(result)
+                    except Exception:
+                        pass
+
             logging.info(f"✅ API扫描完成，共发现 {len(signals)} 个信号")
             return sorted(signals, key=lambda x: x['surge_ratio'], reverse=True)
         
@@ -1687,9 +2196,8 @@ class AutoExchangeStrategy:
 
             logging.info(f"💰 {symbol} 初始计算: 账户{self.account_balance:.2f} × {self.position_size_ratio} × {self.leverage} / {price} = {quantity:.2f}")
             
-            # 获取交易对的精度要求
-            exchange_info = self.client.futures_exchange_info()
-            symbol_info = next((s for s in exchange_info['symbols'] if s['symbol'] == symbol), None)
+            # 获取交易对的精度要求（优先读本地缓存，避免每次建仓都发重量级 API 请求）
+            symbol_info = self._get_symbol_info(symbol)
             
             if not symbol_info:
                 logging.error(f"❌ 无法获取 {symbol} 的交易规则")
@@ -1827,6 +2335,7 @@ class AutoExchangeStrategy:
 ╚════════════════════════════════════════════════════════════════════════════╝
 """)
 
+            notify_positions_changed()
             return True
 
         except BinanceAPIException as e:
@@ -1907,84 +2416,43 @@ class AutoExchangeStrategy:
             success: 是否成功
             error_msg: 错误信息 (如果失败)
         """
-        import datetime
-
-        # 构建日志头部
-        status_icon = "✅" if success else "❌"
-        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-
-        # 变动类型映射
+        ts_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         type_names = {
-            'dynamic_tp': '🔄 动态止盈调整',
-            'manual_tp_sl': '🔧 手动修改止盈止损',
-            'manual_close': '💰 手动平仓',
-            'auto_close': '🤖 自动平仓'
+            'dynamic_tp': '动态止盈调整',
+            'manual_tp_sl': '手动修改止盈止损',
+            'manual_close': '手动平仓',
+            'auto_close': '自动平仓',
         }
         type_name = type_names.get(change_type, change_type)
 
-        # 开始构建详细日志
-        log_lines = [
-            "=" * 80,
-            f"{status_icon} {type_name} - {symbol}",
-            "=" * 80,
-            f"时间: {timestamp}",
+        inner_lines: List[str] = [
+            f"type={type_name} symbol={symbol} success={success} utc={ts_utc}",
         ]
-
-        # 添加详情信息
         if details:
-            log_lines.append("📋 操作详情:")
             for key, value in details.items():
-                if isinstance(value, float):
-                    log_lines.append(f"   {key}: {value:.6f}")
-                else:
-                    log_lines.append(f"   {key}: {value}")
+                inner_lines.append(f"detail {key}={_position_change_fmt_value(value)}")
+        if before_state:
+            for key, value in before_state.items():
+                inner_lines.append(f"before {key}={_position_change_fmt_value(value)}")
+        if after_state:
+            for key, value in after_state.items():
+                inner_lines.append(f"after {key}={_position_change_fmt_value(value)}")
+        if not success and error_msg:
+            inner_lines.append(f"error {_position_change_fmt_value(error_msg)}")
 
-        # 添加前后状态对比
-        if before_state or after_state:
-            log_lines.append("")
-            log_lines.append("📊 状态对比:")
+        asctime = _log_asctime_local()
+        for msg in inner_lines:
+            logging.info("[仓位变动] %s", msg)
 
-            if before_state:
-                log_lines.append("   变动前:")
-                for key, value in before_state.items():
-                    if isinstance(value, float):
-                        log_lines.append(f"     {key}: {value:.6f}")
-                    else:
-                        log_lines.append(f"     {key}: {value}")
-
-            if after_state:
-                log_lines.append("   变动后:")
-                for key, value in after_state.items():
-                    if isinstance(value, float):
-                        log_lines.append(f"     {key}: {value:.6f}")
-                    else:
-                        log_lines.append(f"     {key}: {value}")
-
-        # 添加结果信息
-        if success:
-            log_lines.append("")
-            log_lines.append("✅ 执行成功")
-        else:
-            log_lines.append("")
-            log_lines.append("❌ 执行失败")
-            if error_msg:
-                log_lines.append(f"错误信息: {error_msg}")
-
-        log_lines.append("=" * 80)
-
-        # 输出日志
-        full_log = "\n".join(log_lines)
-        logging.info(f"\n{full_log}")
-
-        # 同时写入专门的仓位变动日志文件
         try:
             log_dir = "logs"
             if not os.path.exists(log_dir):
                 os.makedirs(log_dir)
             position_log_file = os.path.join(log_dir, "position_changes.log")
-
             with open(position_log_file, 'a', encoding='utf-8') as f:
-                f.write(f"\n{full_log}\n")
+                for msg in inner_lines:
+                    f.write(f"{asctime} - INFO - [仓位变动] {msg}\n")
+                f.flush()
         except Exception as e:
             logging.warning(f"写入仓位变动日志失败: {e}")
 
@@ -3251,7 +3719,36 @@ class AutoExchangeStrategy:
 
             # 从记录文件中删除
             self.server_save_positions_record()
-            
+
+            # 写入交易历史记录
+            try:
+                trade_record = {
+                    'symbol': symbol,
+                    'direction': 'long' if is_long_position else 'short',
+                    'entry_price': position['entry_price'],
+                    'exit_price': exit_price,
+                    'quantity': position['quantity'],
+                    'entry_time': position['entry_time'],
+                    'close_time': current_time.isoformat(),
+                    'elapsed_hours': round(elapsed_hours, 2),
+                    'pnl_pct': round(pnl_pct * 100, 4),
+                    'pnl_value': round(pnl_value, 4),
+                    'reason': reason,
+                    'reason_cn': reason_cn,
+                    'position_value': position.get('position_value', 0),
+                    'leverage': position.get('leverage', self.leverage),
+                }
+                if os.path.exists(TRADE_HISTORY_FILE):
+                    with open(TRADE_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                        history = json.load(f)
+                else:
+                    history = []
+                history.append(trade_record)
+                with open(TRADE_HISTORY_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, ensure_ascii=False, indent=2)
+            except Exception as th_err:
+                logging.error(f"❌ 写入交易历史失败: {th_err}")
+
             # 🆕 平仓完成摘要日志（包含订单取消详情）
             cancelled_orders_str = ""
             if cancelled_orders:
@@ -3312,6 +3809,8 @@ class AutoExchangeStrategy:
                             logging.warning(f"⚠️ {symbol} 清理残留订单失败: {cleanup_error}")
             except Exception as cleanup_check_error:
                 logging.warning(f"⚠️ {symbol} 检查残留订单失败: {cleanup_check_error}")
+
+            notify_positions_changed()
         
         except Exception as e:
             logging.error(f"❌ 平仓失败 {position['symbol']}: {e}")
@@ -3379,7 +3878,8 @@ class AutoExchangeStrategy:
                     continue  # 跳过未获取锁的持仓
 
                 try:
-                    logging.info(f"✅ {symbol} 获取锁成功，开始处理")
+                    # 监控每 30s 一轮，勿用 info（多仓时终端会刷屏）
+                    logging.debug(f"✅ {symbol} 获取锁成功，开始处理")
                     # 1. 检查平仓条件
                     exit_reason = self.server_check_exit_conditions(position)
                     if exit_reason:
@@ -3680,6 +4180,8 @@ class AutoExchangeStrategy:
 # ==================== Flask Web服务 ====================
 app = Flask(__name__)
 CORS(app)  # 允许跨域
+# 前端约每 10s 轮询 /api，默认会在终端刷屏打印 GET … 200
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
 auth = HTTPBasicAuth()
 
 # 🔐 用户认证配置
@@ -3703,18 +4205,106 @@ start_time = None  # 系统启动时间
 scan_thread = None
 monitor_thread = None
 
+# 持仓变更 SSE：开仓/平仓/幽灵仓清理/改 TP·SL 时推送，供监控页刷新（减少轮询 /api/positions）
+_POSITION_SSE_LOCK = threading.Lock()
+_POSITION_SSE_QUEUES: List[queue.Queue] = []
+_LAST_POSITION_SSE_NOTIFY = 0.0
+
+
+def notify_positions_changed() -> None:
+    """通知所有已连接监控页：持仓列表或订单绑定已变，请拉取 /api/positions（1s 内合并多次）。"""
+    global _LAST_POSITION_SSE_NOTIFY
+    now = time.time()
+    if now - _LAST_POSITION_SSE_NOTIFY < 1.0:
+        return
+    _LAST_POSITION_SSE_NOTIFY = now
+    with _POSITION_SSE_LOCK:
+        subs = list(_POSITION_SSE_QUEUES)
+    payload = {'type': 'positions_changed'}
+    for q in subs:
+        try:
+            q.put_nowait(payload)
+        except queue.Full:
+            pass
+
+
+# —— 敏感 POST 限流（内存滑动窗口，按 IP + 路径）——
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_EVENTS: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+
+_SENSITIVE_API_RATE_LIMITS: Dict[str, Tuple[int, float]] = {
+    '/api/start_trading': (20, 60.0),
+    '/api/stop_trading': (20, 60.0),
+    '/api/manual_scan': (12, 60.0),
+    '/api/close_position': (40, 60.0),
+    '/api/update_tp_sl': (50, 60.0),
+    '/api/cancel_order': (40, 60.0),
+    '/api/send_daily_report': (10, 3600.0),
+    '/api/config_editable': (20, 60.0),
+    '/api/binance_credentials': (12, 60.0),
+    '/api/binance_test': (20, 60.0),
+}
+
+
+def _request_client_ip() -> str:
+    xff = request.headers.get('X-Forwarded-For', '') or request.headers.get('X-Real-IP', '')
+    if xff:
+        return xff.split(',')[0].strip()[:64]
+    return (request.remote_addr or 'unknown')[:64]
+
+
+def _rate_limit_allow(bucket_key: str, max_calls: int, period_sec: float) -> bool:
+    ip = _request_client_ip()
+    key = (ip, bucket_key)
+    now = time.time()
+    cutoff = now - period_sec
+    with _RATE_LIMIT_LOCK:
+        lst = _RATE_LIMIT_EVENTS[key]
+        while lst and lst[0] < cutoff:
+            lst.pop(0)
+        if len(lst) >= max_calls:
+            return False
+        lst.append(now)
+        return True
+
+
+@app.before_request
+def _api_rate_limit_sensitive_posts():
+    if request.method != 'POST' or not request.path.startswith('/api'):
+        return None
+    spec = _SENSITIVE_API_RATE_LIMITS.get(request.path)
+    if not spec:
+        return None
+    max_n, period = spec
+    if not _rate_limit_allow(request.path, max_n, period):
+        logging.warning('⚠️ API 限流: %s %s', _request_client_ip(), request.path)
+        return jsonify({'success': False, 'error': '请求过于频繁，请稍后再试'}), 429
+    return None
+
+
 # 未配置 API 时仍允许这些路径（由视图内自行返回说明或 400；其余 /api 返回 503 避免访问 None client）
 _UI_ONLY_ALLOWED_API_PATHS = frozenset({
     '/api/status',
     '/api/start_trading',
     '/api/stop_trading',
     '/api/manual_scan',
+    '/api/trade_history',
+    '/api/signal_history',
+    '/api/trade_history_export',
+    '/api/signal_history_export',
+    '/api/daily_report_download',
+    '/api/positions/stream',
+    '/api/config_editable',
+    '/api/binance_credentials',
+    '/api/binance_test',
 })
 
 
 @app.before_request
 def _ui_only_block_data_apis():
     if not request.path.startswith('/api'):
+        return None
+    if request.path == '/api/health':
         return None
     if strategy is None:
         return None
@@ -3735,6 +4325,212 @@ def _ui_only_block_data_apis():
 def index():
     """主页 - Web监控界面"""
     return render_template('monitor.html')
+
+
+@app.route('/params')
+@auth.login_required
+def params_page():
+    """策略参数编辑页（写入 config.ini，并热应用到运行中的 strategy）。"""
+    return render_template('params.html')
+
+
+@app.route('/api/config_editable', methods=['GET', 'POST'])
+@auth.login_required
+def api_config_editable():
+    """读取/保存可编辑的 config.ini 段（不含 BINANCE）。"""
+    if request.method == 'GET':
+        return jsonify({'success': True, 'config': _get_config_editable_dict()})
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        body = {}
+    merged = _merge_editable_post(body)
+    normalized, err = _validate_editable_merged(merged)
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+    parser = configparser.ConfigParser()
+    if os.path.exists(CONFIG_INI_PATH):
+        parser.read(CONFIG_INI_PATH, encoding='utf-8')
+    for sec, kv in normalized.items():
+        if not parser.has_section(sec):
+            parser.add_section(sec)
+        for k, v in kv.items():
+            parser.set(sec, k, v)
+    try:
+        _atomic_write_config_ini(parser)
+    except Exception as e:
+        logging.error(f"❌ 写入 config.ini 失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+    applied = False
+    global strategy
+    if strategy is not None:
+        try:
+            with _STRATEGY_CONFIG_LOCK:
+                _apply_normalized_editable_to_strategy(strategy, normalized)
+            applied = True
+            st = normalized['STRATEGY']
+            rk = normalized['RISK']
+            logging.info(
+                "✅ 策略运行参数已热更新: 杠杆=%s 最大持仓=%s 止损%%=%s 24h涨幅平仓=%s",
+                st.get('leverage'),
+                st.get('max_positions'),
+                rk.get('stop_loss_pct'),
+                rk.get('enable_max_gain_24h_exit'),
+            )
+        except Exception as e:
+            logging.error(f"❌ 热更新策略参数失败: {e}")
+            return jsonify({
+                'success': False,
+                'error': f'已写入 config.ini，但应用到内存失败: {e}',
+            }), 500
+    else:
+        logging.info("✅ config.ini 已更新（进程内 strategy 未初始化，下次启动后加载）")
+
+    return jsonify({
+        'success': True,
+        'applied_runtime': applied,
+        'message': (
+            '已保存并已应用到当前运行策略。已开仓位与交易所已挂止盈/止损单不会自动重算；若遇异常可重启进程以完全对齐。'
+            if applied
+            else '已保存到 config.ini。当前无运行中的策略实例，下次启动进程后将加载。'
+        ),
+    })
+
+
+@app.route('/api/binance_credentials', methods=['GET', 'POST'])
+@auth.login_required
+def api_binance_credentials():
+    """查询/保存 Binance API 密钥（仅写 config.ini；环境变量仍优先于文件）。"""
+    cfg = load_config()
+    fk, fs = _file_binance_keys(cfg)
+    ek, es, src = _resolve_binance_keys_for_effective_trading(cfg)
+    env_key = _strip_cred_plain(os.getenv('BINANCE_API_KEY'))
+    env_sec = _strip_cred_plain(os.getenv('BINANCE_API_SECRET'))
+    env_complete = bool(env_key and env_sec)
+
+    if request.method == 'GET':
+        return jsonify({
+            'success': True,
+            'effective_configured': bool(ek and es),
+            'effective_source': src,
+            'env_overrides_file': env_complete,
+            'file_has_key': bool(fk),
+            'file_has_secret': bool(fs),
+            'key_masked': '********' if ek else '',
+            'secret_masked': '********' if es else '',
+            'key_tail': _key_tail_4(ek) if ek else '',
+            'copyable_key_hint': (
+                f'当前 API Key 尾号（仅标识）: …{_key_tail_4(ek)}' if ek and _key_tail_4(ek) else ''
+            ),
+            'note': (
+                '当前密钥来自环境变量 BINANCE_API_*，config.ini 中的修改在取消环境变量前不会作为运行时生效来源。'
+                if env_complete else ''
+            ),
+        })
+
+    body = request.get_json(silent=True) or {}
+    k = _strip_cred_plain(body.get('api_key'))
+    sec = _strip_cred_plain(body.get('api_secret'))
+    if not k or not sec:
+        return jsonify({'success': False, 'error': 'api_key 与 api_secret 不能为空'}), 400
+    if len(k) < 8 or len(sec) < 8:
+        return jsonify({'success': False, 'error': '密钥长度过短'}), 400
+    try:
+        test_cl = _create_binance_client(k, sec)
+        _configure_binance_http_adapter(getattr(test_cl, 'session', None))
+        t0 = time.time()
+        test_cl.futures_ping()
+        _ = (time.time() - t0) * 1000
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'保存前连通性校验失败: {e}'}), 400
+
+    parser = configparser.ConfigParser()
+    if os.path.exists(CONFIG_INI_PATH):
+        parser.read(CONFIG_INI_PATH, encoding='utf-8')
+    if not parser.has_section('BINANCE'):
+        parser.add_section('BINANCE')
+    parser.set('BINANCE', 'api_key', k)
+    parser.set('BINANCE', 'api_secret', sec)
+    try:
+        _atomic_write_config_ini(parser)
+    except Exception as e:
+        logging.error(f"❌ 写入 Binance 密钥到 config.ini 失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+    ok_re, err_re = _reinit_strategy_binance_client_after_ini_change()
+    if not ok_re:
+        logging.error(f"❌ 保存密钥后热重载客户端失败: {err_re}")
+        return jsonify({
+            'success': False,
+            'error': f'已写入 config.ini，但热重载交易客户端失败: {err_re}',
+        }), 500
+
+    warn = ''
+    if env_complete:
+        warn = '已写入 config.ini。当前进程仍优先使用环境变量 BINANCE_API_*，运行时实际密钥未改变；若需使用新文件密钥请清空环境变量并重启或热重载。'
+
+    logging.info('✅ Binance API 密钥已通过网页更新并写入 config.ini')
+    return jsonify({
+        'success': True,
+        'applied_runtime': not env_complete,
+        'warning': warn,
+        'message': (
+            '已保存到 config.ini，并已尝试热重载 Binance 客户端。'
+            if not warn
+            else warn
+        ),
+    })
+
+
+@app.route('/api/binance_test', methods=['POST'])
+@auth.login_required
+def api_binance_test():
+    """期货 API 连通测试；请求体可带 api_key/api_secret，省略则使用当前生效密钥（环境变量优先）。"""
+    body = request.get_json(silent=True) or {}
+    bk = _strip_cred_plain(body.get('api_key'))
+    bs = _strip_cred_plain(body.get('api_secret'))
+    if not bk or not bs:
+        bk, bs, _src = _resolve_binance_keys_for_effective_trading()
+    if not bk or not bs:
+        return jsonify({
+            'success': False,
+            'ok': False,
+            'error': '未配置密钥：请在请求中传入 api_key / api_secret，或在 config.ini / 环境变量中配置',
+        }), 400
+    try:
+        cl = _create_binance_client(bk, bs)
+        _configure_binance_http_adapter(getattr(cl, 'session', None))
+        t0 = time.time()
+        cl.futures_ping()
+        ms = (time.time() - t0) * 1000
+        return jsonify({
+            'success': True,
+            'ok': True,
+            'latency_ms': round(ms, 1),
+            'message': 'U 本位期货 API 连通正常',
+        })
+    except Exception as e:
+        return jsonify({
+            'success': True,
+            'ok': False,
+            'message': str(e)[:300],
+        })
+
+
+@app.route('/api/health')
+def api_health():
+    """探活：无需 Basic 认证、不调用交易所（供负载均衡 / 脚本检测）。"""
+    api_ok = bool(strategy is not None and getattr(strategy, 'api_configured', False))
+    uptime_sec = None
+    if start_time is not None:
+        uptime_sec = int((datetime.now(timezone.utc) - start_time).total_seconds())
+    return jsonify({
+        'ok': True,
+        'service': 'ae_server',
+        'api_configured': api_ok,
+        'trading': bool(is_running),
+        'uptime_sec': uptime_sec,
+    })
 
 
 # ==================== API接口 - 查看类 ====================
@@ -3777,6 +4573,7 @@ def get_status():
             # 降级：如果获取详细信息失败，使用简单余额
             balance = strategy.server_get_account_balance()
             strategy.account_balance = balance
+            strategy.account_available_balance = balance
             result['balance'] = balance
         
         return jsonify(result)
@@ -3865,7 +4662,7 @@ def get_positions():
             account_balance = 0
         
         result = []
-        logging.info(f"🔍 开始处理持仓，strategy.positions 长度: {len(strategy.positions)}")
+        logging.debug("get_positions: strategy.positions 长度=%d", len(strategy.positions))
         for pos in strategy.positions:
             symbol = pos['symbol']
             # 从交易所获取实时价格和盈亏
@@ -3875,10 +4672,10 @@ def get_positions():
             except (TypeError, ValueError):
                 _amt = 0.0
             if abs(_amt) < 1e-8:
-                logging.info(f"⏭️ {symbol} 交易所无持仓，跳过返回（应已被 prune 清理）")
+                logging.debug("⏭️ %s 交易所无持仓，跳过返回", symbol)
                 continue
 
-            logging.info(f"🔍 处理持仓: {pos.get('symbol', 'UNKNOWN')}")
+            logging.debug("get_positions 处理持仓: %s", pos.get('symbol', 'UNKNOWN'))
             
             if binance_pos:
                 mark_price = float(binance_pos['markPrice'])
@@ -3915,7 +4712,7 @@ def get_positions():
             # 3. 仓位占比 = 投入金额 / 账户总余额 * 100%
             position_ratio = (position_margin / account_balance * 100) if account_balance > 0 else 0
             
-            # 获取挂单
+            # 获取挂单（与下方 get_tp_sl 共用，避免每轮轮询同一 symbol 打两次算法单 API）
             try:
                 algo_orders = strategy.client.futures_get_open_algo_orders(symbol=symbol)
                 orders = []
@@ -3929,6 +4726,7 @@ def get_positions():
                     })
             except Exception as e:
                 logging.error(f"❌ 查询 {symbol} 挂单失败: {e}")
+                algo_orders = []
                 orders = []
             
             # 计算持仓时间
@@ -3936,14 +4734,14 @@ def get_positions():
             elapsed_hours = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
 
             # 🔧 修复：算法单在 openAlgoOrders；普通条件单在 openOrders；最后合并本地 pos 缓存
-            def get_tp_sl_for_position(symbol, pos_row):
+            def get_tp_sl_for_position(symbol, pos_row, algo_os_cached):
                 tp_price_val = "N/A"
                 sl_price_val = "N/A"
                 is_long = pos_row.get('direction') == 'long'
                 close_side = position_close_side(is_long)
                 try:
-                    algo_os = strategy.client.futures_get_open_algo_orders(symbol=symbol)
-                    logging.info(f"🔍 {symbol} 查询算法单: {len(algo_os)} 条")
+                    algo_os = list(algo_os_cached or [])
+                    logging.debug("🔍 %s 算法单: %d 条", symbol, len(algo_os))
                     for order in algo_os:
                         ot = order.get('orderType', '')
                         sd = order.get('side', '')
@@ -3954,17 +4752,17 @@ def get_positions():
                             continue
                         if ot in FUTURES_ALGO_TP_TYPES and tp_price_val == "N/A":
                             tp_price_val = f"{trig:.6f}"
-                            logging.info(f"✅ {symbol} 算法单止盈 {ot} 触发价={tp_price_val}")
+                            logging.debug("✅ %s 算法单止盈 %s 触发价=%s", symbol, ot, tp_price_val)
                         elif ot in FUTURES_ALGO_SL_TYPES and sl_price_val == "N/A":
                             sl_price_val = f"{trig:.6f}"
-                            logging.info(f"✅ {symbol} 算法单止损 {ot} 触发价={sl_price_val}")
+                            logging.debug("✅ %s 算法单止损 %s 触发价=%s", symbol, ot, sl_price_val)
                 except Exception as e:
-                    logging.warning(f"⚠️ {symbol} 查询算法单失败: {e}")
+                    logging.warning(f"⚠️ {symbol} 解析算法单失败: {e}")
 
                 if tp_price_val == "N/A" or sl_price_val == "N/A":
                     try:
                         all_orders = strategy.client.futures_get_open_orders(symbol=symbol)
-                        logging.info(f"🔍 {symbol} 查询普通挂单: {len(all_orders)} 条")
+                        logging.debug("🔍 %s 普通挂单: %d 条", symbol, len(all_orders))
                         for order in all_orders:
                             order_type = order.get('type', '')
                             order_side = order.get('side', '')
@@ -3984,20 +4782,20 @@ def get_positions():
                 if tp_price_val == "N/A" and pos_row.get('tp_price') is not None:
                     try:
                         tp_price_val = f"{float(pos_row['tp_price']):.6f}"
-                        logging.info(f"✅ {symbol} 使用本地缓存止盈价 {tp_price_val}")
+                        logging.debug("✅ %s 使用本地缓存止盈价 %s", symbol, tp_price_val)
                     except (TypeError, ValueError):
                         pass
                 if sl_price_val == "N/A" and pos_row.get('sl_price') is not None:
                     try:
                         sl_price_val = f"{float(pos_row['sl_price']):.6f}"
-                        logging.info(f"✅ {symbol} 使用本地缓存止损价 {sl_price_val}")
+                        logging.debug("✅ %s 使用本地缓存止损价 %s", symbol, sl_price_val)
                     except (TypeError, ValueError):
                         pass
 
-                logging.info(f"📊 {symbol} 止盈止损展示: TP={tp_price_val}, SL={sl_price_val}")
+                logging.debug("📊 %s 止盈止损展示: TP=%s, SL=%s", symbol, tp_price_val, sl_price_val)
                 return tp_price_val, sl_price_val
 
-            tp_price, sl_price = get_tp_sl_for_position(symbol, pos)
+            tp_price, sl_price = get_tp_sl_for_position(symbol, pos, algo_orders)
 
             result.append({
                 'position_id': pos.get('position_id', 'N/A'),  # 添加position_id用于精确修改
@@ -4027,17 +4825,17 @@ def get_positions():
                 'sl_price': sl_price,  # 止损价格
             })
         
-        logging.info(f"🔍 get_positions 方法即将返回数据，result 长度: {len(result)}")
-        logging.info(f"🔍 返回 JSON 结构: success=True, positions长度={len(result)}, account_balance={account_balance}")
+        logging.debug(
+            "get_positions 返回: positions=%d account_balance=%s",
+            len(result),
+            account_balance,
+        )
 
-        response_data = {
+        return jsonify({
             'success': True,
             'positions': result,
-            'account_balance': account_balance  # 也在顶层返回账户余额
-        }
-        logging.info(f"🔍 完整响应数据预览: {response_data}")
-
-        return jsonify(response_data)
+            'account_balance': account_balance,
+        })
     
     except Exception as e:
         logging.error(f"❌ 获取持仓失败: {e}")
@@ -4046,14 +4844,115 @@ def get_positions():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/positions/stream')
+@auth.login_required
+def positions_stream():
+    """SSE：后端持仓/订单有结构性变化时推送，前端再拉 /api/positions（监控循环仍在服务端运行）。"""
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=32)
+        with _POSITION_SSE_LOCK:
+            _POSITION_SSE_QUEUES.append(q)
+        try:
+            yield f"data: {json.dumps({'type': 'connected'})}\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=25.0)
+                    yield f"data: {json.dumps(msg)}\n\n"
+                except queue.Empty:
+                    yield ": ping\n\n"
+        finally:
+            with _POSITION_SSE_LOCK:
+                try:
+                    _POSITION_SSE_QUEUES.remove(q)
+                except ValueError:
+                    pass
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
+# 监控页 /api/logs 默认过滤：这些 INFO 行对看盘价值低、刷屏多（完整日志仍在 ae_server_*.log 文件中）
+_LOG_MONITOR_NOISE_INFO_MARKERS = (
+    '💓 系统运行中',
+    '💰 账户余额:',  # 定时扫描前余额行，看盘价值低
+    '👁️ [监控] 已检查',
+    '🔄 exchange_info 缓存已刷新',
+    '📦 开始并发预热昨日缓存',
+    '📦 昨日缓存预热完成',
+    '📌 ',  # 止盈止损 ID 与交易所对齐（高频）
+    '💾 已保存持仓记录',
+    '💾 已保存建仓记录到文件',
+    'get_positions 返回',
+    'get_positions:',
+    'get_positions 处理持仓',
+    'get_positions: strategy',
+    '收到修改止盈止损请求',
+    '解析参数: symbol=',
+    '记录的订单ID',
+    '请求参数 - TP价格',
+    '当前订单[',
+    '检查订单:',
+    '重新查询后还有',
+    '跳过已取消的订单',
+    '预取消算法单',
+    '预清理算法单',
+    '从交易所获取实际持仓数量',
+    '订单验证结果: TP验证',
+    '算法单API响应',
+    '创建止盈算法单:',
+    '创建止损算法单:',
+    '止盈 algoId/orderId',
+    '止损算法单API响应',
+    '普通订单查询结果',
+    '当前普通订单:',
+)
+
+
+def _log_line_ok_for_monitor(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if ' - DEBUG - ' in s:
+        return False
+    if ' - ERROR - ' in s or ' - CRITICAL - ' in s:
+        return True
+    if ' - WARNING - ' in s:
+        return True
+    if ' - INFO - ' in s:
+        for m in _LOG_MONITOR_NOISE_INFO_MARKERS:
+            if m in s:
+                return False
+        return True
+    # 非标准 logging 行（如多行异常的续行）不混入监控要点
+    return False
+
+
+# 监控页仓位段：仅展示 server_log_position_change 改版后的单行格式，忽略旧版多行块
+_POSITION_CHANGE_LOG_STD_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - INFO - \[仓位变动\] '
+)
+
+
+def _position_changes_line_for_monitor(s: str) -> bool:
+    return bool(_POSITION_CHANGE_LOG_STD_RE.match(s.strip()))
+
+
 @app.route('/api/logs')
 @auth.login_required
 def get_logs():
-    """获取最新日志（主日志取文件末尾 N 行；不再与 position_changes 混排避免顺序错乱）。"""
+    """获取最新日志。默认 monitor 模式：去掉高频噪音 INFO，保留 WARNING+ 与业务要点；?full=1 返回未过滤尾部。"""
     try:
         # 获取请求参数
         lines_count = request.args.get('lines', 100, type=int)
         lines_count = min(max(lines_count, 1), 500)  # 最多500行
+        full_tail = request.args.get('full', 0, type=int) == 1
 
         log_files = glob.glob(os.path.join(log_dir, 'ae_server_*.log'))
         latest_log = max(log_files, key=os.path.getmtime) if log_files else None
@@ -4064,36 +4963,60 @@ def get_logs():
         if latest_log:
             with open(latest_log, 'r', encoding='utf-8') as f:
                 main_logs = f.readlines()
-            chunk = main_logs[-lines_count:] if len(main_logs) > lines_count else main_logs
-            # 网页上 newest 在上：文件末行是最新，反转后展示
-            last_lines = list(reversed(chunk))
+            if full_tail:
+                chunk = main_logs[-lines_count:] if len(main_logs) > lines_count else main_logs
+                last_lines = list(reversed(chunk))
+            else:
+                # 多读一些再过滤；分桶合并，避免大量 INFO/WARNING 占满条数把最近的 ERROR 挤出（如获取余额超时）
+                raw_take = min(len(main_logs), max(lines_count * 40, 600))
+                rev = list(reversed(main_logs[-raw_take:]))
+                errs: List[str] = []
+                warns: List[str] = []
+                infos: List[str] = []
+                for ln in rev:
+                    st = ln.strip()
+                    if not st:
+                        continue
+                    if ' - ERROR - ' in st or ' - CRITICAL - ' in st:
+                        errs.append(st)
+                    elif ' - WARNING - ' in st:
+                        warns.append(st)
+                    elif _log_line_ok_for_monitor(st):
+                        infos.append(st)
+                merged = (errs + warns + infos)[:lines_count]
+                last_lines = merged
             log_file_name = os.path.basename(latest_log)
 
         position_snippet: List[str] = []
         position_log_file = os.path.join(log_dir, 'position_changes.log')
         if os.path.exists(position_log_file):
-            pos_tail = min(30, lines_count)
+            pos_want = min(24, lines_count)
             with open(position_log_file, 'r', encoding='utf-8') as f:
                 plines = f.readlines()
             if plines:
-                pchunk = plines[-pos_tail:] if len(plines) > pos_tail else plines
-                position_snippet = list(reversed([line.strip() for line in pchunk]))
-                if log_file_name == 'no logs found':
-                    log_file_name = f"position_changes.log(尾{len(position_snippet)}行)"
-                else:
-                    log_file_name = f"{log_file_name} | position_changes.log(尾{len(position_snippet)}行)"
+                scan_lines = max(pos_want * 80, 400)
+                chunk = plines[-scan_lines:] if len(plines) > scan_lines else plines
+                std_only = [ln.strip() for ln in chunk if _position_changes_line_for_monitor(ln)]
+                tail_std = std_only[-pos_want:] if len(std_only) > pos_want else std_only
+                position_snippet = list(reversed(tail_std))
+                if position_snippet:
+                    if log_file_name == 'no logs found':
+                        log_file_name = f"position_changes.log(标准行{len(position_snippet)}条)"
+                    else:
+                        log_file_name = f"{log_file_name} | position_changes.log(标准行{len(position_snippet)}条)"
 
         out_lines: List[str] = []
         if position_snippet:
-            out_lines.append('--- position_changes.log (最近) ---')
+            out_lines.append('--- 仓位变动（仅单行标准格式，旧版多行块已忽略） ---')
             out_lines.extend(position_snippet)
-            out_lines.append('--- ae_server 主日志 (最近) ---')
-        out_lines.extend(line.strip() for line in last_lines)
+            out_lines.append('--- ae_server 主日志（要点' + ('，未过滤' if full_tail else '，已过滤噪音') + '）---')
+        out_lines.extend(last_lines)
 
         return jsonify({
             'success': True,
             'logs': out_lines,
-            'log_file': log_file_name
+            'log_file': log_file_name,
+            'log_view': 'full' if full_tail else 'monitor',
         })
     
     except Exception as e:
@@ -4705,6 +5628,9 @@ def update_tp_sl():
 
         logging.info(f"📊 {symbol} 订单验证结果: TP验证={tp_order_validated}, SL验证={sl_order_validated}, 总体成功={actual_success}")
 
+        if actual_success:
+            notify_positions_changed()
+
         return jsonify({
             'success': actual_success,
             'message': '止盈止损已更新' if actual_success else '止盈止损更新失败',
@@ -4807,11 +5733,318 @@ def get_position_logs():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/strategy_params')
+@auth.login_required
+def get_strategy_params():
+    """获取策略运行参数"""
+    try:
+        if strategy is None:
+            return jsonify({'error': 'Strategy not initialized'}), 500
+        s = strategy
+        return jsonify({
+            'success': True,
+            'params': {
+                'core': {
+                    'label': '核心参数',
+                    'items': [
+                        {'key': '杠杆', 'value': f"{s.leverage}x"},
+                        {'key': '单仓比例', 'value': f"{s.position_size_ratio * 100:.1f}%"},
+                        {'key': '最大持仓数', 'value': s.max_positions},
+                        {'key': '每日最大建仓', 'value': s.max_daily_entries},
+                        {'key': '单次扫描最多开仓', 'value': s.max_opens_per_scan if s.max_opens_per_scan else '不限制'},
+                        {'key': '每小时建仓限制', 'value': '启用' if s.enable_hourly_entry_limit else '关闭'},
+                    ]
+                },
+                'signal': {
+                    'label': '信号过滤',
+                    'items': [
+                        {'key': '卖量暴涨阈值（下限）', 'value': f"{s.sell_surge_threshold}x"},
+                        {'key': '卖量暴涨阈值（上限）', 'value': f"{s.sell_surge_max}x"},
+                        {'key': '买量倍数风控', 'value': '启用' if s.enable_intraday_buy_ratio_filter else '关闭'},
+                        {'key': '买量危险区间', 'value': '  |  '.join(f"{a}-{b}x" for a, b in s.intraday_buy_ratio_danger_ranges)},
+                    ]
+                },
+                'tp': {
+                    'label': '止盈参数',
+                    'items': [
+                        {'key': '强势币止盈', 'value': f"{s.strong_coin_tp_pct}%"},
+                        {'key': '中势币止盈', 'value': f"{s.medium_coin_tp_pct}%"},
+                        {'key': '弱势币止盈', 'value': f"{s.weak_coin_tp_pct}%"},
+                        {'key': '2h动态止盈强势K占比', 'value': f"{s.dynamic_tp_2h_ratio * 100:.0f}%"},
+                        {'key': '2h动态止盈跌幅阈值', 'value': f"{s.dynamic_tp_2h_growth_threshold * 100:.1f}%"},
+                        {'key': '12h动态止盈强势K占比', 'value': f"{s.dynamic_tp_12h_ratio * 100:.0f}%"},
+                        {'key': '12h动态止盈跌幅阈值', 'value': f"{s.dynamic_tp_12h_growth_threshold * 100:.1f}%"},
+                    ]
+                },
+                'risk': {
+                    'label': '止损 / 风控',
+                    # 两列展示，压缩顶栏高度（前端 hparam-col-split）
+                    'columns': [
+                        [
+                            {'key': '止损比例', 'value': f"{s.stop_loss_pct}%"},
+                            {'key': '最大持仓时长', 'value': f"{s.max_hold_hours:.0f}h"},
+                            {'key': '12h及早止损', 'value': '启用' if s.enable_12h_early_stop else '关闭'},
+                            {'key': '12h及早止损涨幅阈值', 'value': f"{s.early_stop_12h_threshold * 100:.1f}%"},
+                        ],
+                        [
+                            {'key': '24h涨幅平仓', 'value': '启用' if s.enable_max_gain_24h_exit else '关闭'},
+                            {'key': '24h涨幅平仓阈值', 'value': f"{s.max_gain_24h_threshold * 100:.2f}%"},
+                            {'key': 'BTC昨日阳线不建新仓', 'value': '启用' if s.enable_btc_yesterday_yang_no_new_entry else '关闭'},
+                            {'key': 'BTC昨日阳线UTC日初平仓', 'value': '启用' if s.enable_btc_yesterday_yang_flatten_at_open else '关闭'},
+                        ],
+                    ],
+                },
+            }
+        })
+    except Exception as e:
+        logging.error(f"❌ 获取策略参数失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+def _parse_iso_datetime_param(s: Optional[str]) -> Optional[datetime]:
+    """解析查询参数中的 ISO 时间，统一为 UTC；空串返回 None。"""
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _trade_record_sort_ts(t: dict) -> Optional[datetime]:
+    """用于时段筛选：优先平仓时间，否则开仓时间。"""
+    for key in ('close_time', 'entry_time'):
+        raw = t.get(key)
+        if not raw:
+            continue
+        try:
+            return _parse_iso_datetime_param(str(raw))
+        except ValueError:
+            continue
+    return None
+
+
+def _signal_record_sort_ts(s: dict) -> Optional[datetime]:
+    raw = s.get('scan_time') or ''
+    if not raw:
+        return None
+    try:
+        return _parse_iso_datetime_param(str(raw))
+    except ValueError:
+        return None
+
+
+def _signal_event_ts_for_sort(s: dict) -> Optional[datetime]:
+    """列表/导出排序：优先信号发生时间 signal_time（与界面「信号时间」一致），否则退回 scan_time。"""
+    raw = s.get('signal_time')
+    if raw:
+        t = str(raw).strip()
+        if t.endswith(' UTC'):
+            t = t[:-4].strip()
+        try:
+            norm = t.replace(' ', 'T') if 'T' not in t else t
+            dt = datetime.fromisoformat(norm)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            try:
+                return _parse_iso_datetime_param(str(raw).strip())
+            except ValueError:
+                pass
+    return _signal_record_sort_ts(s)
+
+
+def _signal_history_sort_key(x: dict) -> Tuple[datetime, float, str]:
+    dt = _signal_event_ts_for_sort(x) or datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        ratio = float(x.get('surge_ratio') or 0)
+    except (TypeError, ValueError):
+        ratio = 0.0
+    return (dt, ratio, str(x.get('symbol') or ''))
+
+
+@app.route('/api/trade_history')
+@auth.login_required
+def get_trade_history():
+    """获取交易历史记录"""
+    try:
+        limit = int(request.args.get('limit', 50))
+        if not os.path.exists(TRADE_HISTORY_FILE):
+            return jsonify({'success': True, 'trades': [], 'total': 0})
+        with open(TRADE_HISTORY_FILE, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        # 最新在前
+        history = list(reversed(history))
+        total = len(history)
+        return jsonify({'success': True, 'trades': history[:limit], 'total': total})
+    except Exception as e:
+        logging.error(f"❌ 获取交易历史失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trade_history_export')
+@auth.login_required
+def export_trade_history_csv():
+    """导出交易记录为 CSV；可选查询参数 start、end（ISO8601，含时区或本地解析由前端保证为 UTC）。"""
+    try:
+        try:
+            start = _parse_iso_datetime_param(request.args.get('start'))
+            end = _parse_iso_datetime_param(request.args.get('end'))
+        except ValueError as e:
+            return jsonify({'success': False, 'error': f'时间格式无效: {e}'}), 400
+        if start and end and start > end:
+            return jsonify({'success': False, 'error': '开始时间不能晚于结束时间'}), 400
+
+        if not os.path.exists(TRADE_HISTORY_FILE):
+            rows_out: List[dict] = []
+        else:
+            with open(TRADE_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                rows_out = json.load(f)
+            if not isinstance(rows_out, list):
+                rows_out = []
+
+        filtered: List[dict] = []
+        no_range = start is None and end is None
+        for t in rows_out:
+            if not isinstance(t, dict):
+                continue
+            ts = _trade_record_sort_ts(t)
+            if not no_range:
+                if ts is None:
+                    continue
+                if start and ts < start:
+                    continue
+                if end and ts > end:
+                    continue
+            filtered.append(t)
+
+        def _trade_sort_key(x: dict):
+            tsv = _trade_record_sort_ts(x)
+            return tsv or datetime.min.replace(tzinfo=timezone.utc)
+
+        filtered.sort(key=_trade_sort_key)
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([
+            'symbol', 'direction', 'entry_price', 'exit_price', 'quantity',
+            'entry_time', 'close_time', 'elapsed_hours', 'pnl_pct', 'pnl_value',
+            'reason', 'reason_cn', 'position_value', 'leverage',
+        ])
+        for t in filtered:
+            w.writerow([
+                t.get('symbol', ''),
+                t.get('direction', ''),
+                t.get('entry_price', ''),
+                t.get('exit_price', ''),
+                t.get('quantity', ''),
+                t.get('entry_time', ''),
+                t.get('close_time', ''),
+                t.get('elapsed_hours', ''),
+                t.get('pnl_pct', ''),
+                t.get('pnl_value', ''),
+                t.get('reason', ''),
+                t.get('reason_cn', ''),
+                t.get('position_value', ''),
+                t.get('leverage', ''),
+            ])
+
+        raw = '\ufeff' + buf.getvalue()
+        fname = f"trade_history_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+        return Response(
+            raw.encode('utf-8'),
+            mimetype='text/csv; charset=utf-8',
+            headers={
+                'Content-Disposition': f'attachment; filename="{fname}"',
+                'Cache-Control': 'no-store',
+            },
+        )
+    except Exception as e:
+        logging.error(f"❌ 导出交易 CSV 失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/signal_history_export')
+@auth.login_required
+def export_signal_history_csv():
+    """导出信号记录为 CSV；时段按 scan_time 筛选，参数 start / end 可选。"""
+    try:
+        try:
+            start = _parse_iso_datetime_param(request.args.get('start'))
+            end = _parse_iso_datetime_param(request.args.get('end'))
+        except ValueError as e:
+            return jsonify({'success': False, 'error': f'时间格式无效: {e}'}), 400
+        if start and end and start > end:
+            return jsonify({'success': False, 'error': '开始时间不能晚于结束时间'}), 400
+
+        if not os.path.exists(SIGNAL_HISTORY_FILE):
+            rows_out = []
+        else:
+            with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                rows_out = json.load(f)
+            if not isinstance(rows_out, list):
+                rows_out = []
+
+        filtered: List[dict] = []
+        no_range = start is None and end is None
+        for s in rows_out:
+            if not isinstance(s, dict):
+                continue
+            ts = _signal_record_sort_ts(s)
+            if not no_range:
+                if ts is None:
+                    continue
+                if start and ts < start:
+                    continue
+                if end and ts > end:
+                    continue
+            filtered.append(s)
+
+        filtered.sort(key=_signal_history_sort_key, reverse=True)
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([
+            'scan_time', 'signal_time', 'symbol', 'surge_ratio', 'price',
+            'intraday_buy_ratio', 'opened',
+        ])
+        for s in filtered:
+            w.writerow([
+                s.get('scan_time', ''),
+                s.get('signal_time', ''),
+                s.get('symbol', ''),
+                s.get('surge_ratio', ''),
+                s.get('price', ''),
+                s.get('intraday_buy_ratio', ''),
+                'yes' if s.get('opened') else 'no',
+            ])
+
+        raw = '\ufeff' + buf.getvalue()
+        fname = f"signal_history_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+        return Response(
+            raw.encode('utf-8'),
+            mimetype='text/csv; charset=utf-8',
+            headers={
+                'Content-Disposition': f'attachment; filename="{fname}"',
+                'Cache-Control': 'no-store',
+            },
+        )
+    except Exception as e:
+        logging.error(f"❌ 导出信号 CSV 失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/start_trading', methods=['POST'])
 @auth.login_required
 def start_trading():
     """启动自动交易"""
-    global is_running, scan_thread, monitor_thread
+    global is_running
     
     try:
         logging.info("📥 收到 Web 请求: 启动交易 (POST /api/start_trading)")
@@ -4830,26 +6063,13 @@ def start_trading():
             flush_logging_handlers()
             return jsonify({'success': False, 'message': '已经在运行中'})
         
-        # ✨ 立即设置标志（在启动线程之前）
+        # 扫描/监控线程由 main() 在进程启动时已创建；此处只打开开关，避免重复线程导致同一动作执行两遍
         is_running = True
-        
-        try:
-            # 启动扫描线程
-            scan_thread = threading.Thread(target=scan_loop, daemon=True)
-            scan_thread.start()
-            
-            # 启动监控线程
-            monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-            monitor_thread.start()
-            
-            logging.info("🚀 Web 界面: 自动交易已启动（已新建 scan_loop / monitor_loop 线程，is_running=True）")
-            flush_logging_handlers()
-            
-            return jsonify({'success': True, 'message': '自动交易已启动'})
-        except Exception:
-            # 启动失败，恢复标志
-            is_running = False
-            raise
+        logging.info(
+            "🚀 Web 界面: 自动交易已启动（复用已有 scan_loop / monitor_loop 线程，is_running=True）"
+        )
+        flush_logging_handlers()
+        return jsonify({'success': True, 'message': '自动交易已启动'})
     
     except Exception as e:
         logging.error(f"❌ 启动交易失败: {e}")
@@ -4875,6 +6095,37 @@ def send_daily_report_api():
     except Exception as e:
         logging.error(f"❌ 手动发送每日报告失败: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/daily_report_download')
+@auth.login_required
+def daily_report_download():
+    """下载已落盘的日报 txt（默认当天 UTC 日期，可选 ?date=YYYYMMDD）。"""
+    raw = (request.args.get('date') or '').strip()
+    if not raw:
+        d = datetime.now(timezone.utc).strftime('%Y%m%d')
+    else:
+        if len(raw) != 8 or not raw.isdigit():
+            return jsonify({'success': False, 'error': 'date 须为 8 位 YYYYMMDD（UTC 日历日）'}), 400
+        d = raw
+    fname = f'daily_report_{d}.txt'
+    path = os.path.join(log_dir, fname)
+    if not os.path.isfile(path):
+        return jsonify({
+            'success': False,
+            'error': f'未找到 {fname}（可能尚未生成过该日日报）',
+        }), 404
+    try:
+        return send_file(
+            path,
+            as_attachment=True,
+            download_name=fname,
+            mimetype='text/plain; charset=utf-8',
+        )
+    except Exception as e:
+        logging.error(f"❌ 下载日报失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/stop_trading', methods=['POST'])
 @auth.login_required
@@ -4918,21 +6169,27 @@ def manual_scan():
         
         logging.info("🔍 Web界面触发手动扫描...")
         
-        # 更新账户余额
-        strategy.account_balance = strategy.server_get_account_balance()
+        if not strategy.server_sync_wallet_snapshot():
+            strategy.account_balance = strategy.server_get_account_balance()
+            strategy.account_available_balance = strategy.account_balance
         
         # 扫描信号
         signals = strategy.server_scan_sell_surge_signals()
         
         # 尝试建仓（与 hm1l 一致：按倍数排序后连续尝试，直至额度/扫描上限）
         opened_count = 0
+        opened_syms = set()
         cap = strategy.max_opens_per_scan
         for signal in signals:
             if cap > 0 and opened_count >= cap:
                 break
             if strategy.server_open_position(signal):
                 opened_count += 1
-        
+                opened_syms.add(signal['symbol'])
+
+        if signals:
+            save_signal_records(signals, datetime.now(timezone.utc).isoformat(), opened_syms)
+
         return jsonify({
             'success': True,
             'message': f'扫描完成，发现 {len(signals)} 个信号，建仓 {opened_count} 个',
@@ -4941,6 +6198,100 @@ def manual_scan():
     
     except Exception as e:
         logging.error(f"❌ 手动扫描失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/klines')
+@auth.login_required
+def api_klines():
+    """返回合约 K 线数据，供前端 Lightweight Charts 使用"""
+    try:
+        if strategy is None or not getattr(strategy, 'api_configured', False):
+            return jsonify({'success': False, 'error': '未配置 API'}), 503
+        symbol   = request.args.get('symbol', 'BTCUSDT').upper()
+        interval = request.args.get('interval', '1h')
+        limit    = min(int(request.args.get('limit', 200)), 500)
+        klines   = strategy.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        data = [
+            {
+                'time':   int(k[0]) // 1000,
+                'open':   float(k[1]),
+                'high':   float(k[2]),
+                'low':    float(k[3]),
+                'close':  float(k[4]),
+                'volume': float(k[5]),
+            }
+            for k in klines
+        ]
+        return jsonify({'success': True, 'data': data})
+    except Exception as e:
+        logging.error(f"❌ api_klines 失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def save_signal_records(signals: list, scan_time: str, opened_symbols: set):
+    """写入 signal_history.json，保留最近 90 天。
+
+    同一 (symbol, signal_time) 只保留一行：定时扫描与手动扫描在同一 UTC 小时内会重复检测
+    上一完整小时，原先会追加两条；现改为合并，`opened` 取多次扫描的或（任一次建仓即为 True）。
+    """
+    try:
+        with _signal_history_lock:
+            if os.path.exists(SIGNAL_HISTORY_FILE):
+                with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            else:
+                history = []
+            if not isinstance(history, list):
+                history = []
+
+            for s in signals:
+                sym = s.get('symbol', '')
+                sig_t = s.get('signal_time', '')
+                opened_now = sym in opened_symbols
+                key = (sym, sig_t)
+
+                merged = False
+                for r in history:
+                    if (r.get('symbol', ''), r.get('signal_time', '')) == key:
+                        r['opened'] = bool(r.get('opened')) or opened_now
+                        merged = True
+                        break
+                if not merged:
+                    history.append({
+                        'scan_time':          scan_time,
+                        'signal_time':        sig_t,
+                        'symbol':             sym,
+                        'surge_ratio':        round(float(s.get('surge_ratio', 0)), 4),
+                        'price':              s.get('price', 0),
+                        'intraday_buy_ratio': round(float(s.get('intraday_buy_ratio', 0)), 4),
+                        'opened':             opened_now,
+                    })
+
+            # 保留最近 90 天（按 scan_time）
+            cutoff = (datetime.now(timezone.utc) - __import__('datetime').timedelta(days=90)).isoformat()
+            history = [r for r in history if r.get('scan_time', '') >= cutoff]
+            with open(SIGNAL_HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"❌ 写入信号历史失败: {e}")
+
+
+@app.route('/api/signal_history')
+@auth.login_required
+def api_signal_history():
+    """返回信号历史记录，按日期+倍数降序。"""
+    try:
+        limit = int(request.args.get('limit', 500))
+        if not os.path.exists(SIGNAL_HISTORY_FILE):
+            return jsonify({'success': True, 'signals': [], 'total': 0})
+        with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        history.sort(key=_signal_history_sort_key, reverse=True)
+        total = len(history)
+        return jsonify({'success': True, 'signals': history[:limit], 'total': total})
+    except Exception as e:
+        logging.error(f"❌ 获取信号历史失败: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -4974,9 +6325,10 @@ def scan_loop():
                 logging.info(f"🔍 [定时扫描] UTC {now.strftime('%Y-%m-%d %H:%M:%S')} 开始扫描...")
                 
                 try:
-                    # 更新账户余额
-                    strategy.account_balance = strategy.server_get_account_balance()
-                    logging.info(f"💰 账户余额: ${strategy.account_balance:.2f}")
+                    if not strategy.server_sync_wallet_snapshot():
+                        strategy.account_balance = strategy.server_get_account_balance()
+                        strategy.account_available_balance = strategy.account_balance
+                    logging.info(f"💰 账户余额: ${strategy.account_balance:.2f}  可用余额: ${strategy.account_available_balance:.2f}")
                     
                     # 🔧 强制刷新日志
                     for handler in logging.getLogger().handlers:
@@ -4985,20 +6337,21 @@ def scan_loop():
                     
                     # 扫描信号
                     signals = strategy.server_scan_sell_surge_signals()
-                    
+
                     if signals:
                         logging.info(f"✅ 发现 {len(signals)} 个信号")
                         # 显示前5个信号
-                        for i, signal in enumerate(signals[:5]):
+                        for signal in signals[:5]:
                             logging.info(f"   {signal['symbol']}: {signal['surge_ratio']:.2f}倍 @ {signal['price']:.6f}")
-                        
+
                         # 🔧 强制刷新日志
                         for handler in logging.getLogger().handlers:
                             if hasattr(handler, 'flush'):
                                 handler.flush()
-                        
+
                         # 尝试建仓：与 hm1l 一致，按卖量倍数降序连续尝试（受 max_positions/max_daily_entries/可选 cap）
                         opened_count = 0
+                        opened_syms = set()
                         cap = strategy.max_opens_per_scan
                         for signal in signals:
                             if not is_running:
@@ -5007,7 +6360,10 @@ def scan_loop():
                                 break
                             if strategy.server_open_position(signal):
                                 opened_count += 1
+                                opened_syms.add(signal['symbol'])
                                 logging.info(f"🚀 开仓成功: {signal['symbol']} (本轮第{opened_count}笔)")
+
+                        save_signal_records(signals, now.isoformat(), opened_syms)
                         
                         if opened_count == 0:
                             logging.warning("⚠️ 所有信号均无法建仓（已达到限制或已持有）")
@@ -5148,7 +6504,7 @@ def signal_handler(sig, frame):
 # ==================== 主程序 ====================
 def main():
     """主函数"""
-    global strategy, is_running
+    global strategy, is_running, scan_thread, monitor_thread
     
     # 注册信号处理
     signal.signal(signal.SIGINT, signal_handler)
@@ -5170,7 +6526,9 @@ def main():
         logging.info("✅ 策略引擎初始化完成")
         
         if strategy.api_configured:
-            strategy.account_balance = strategy.server_get_account_balance()
+            if not strategy.server_sync_wallet_snapshot():
+                strategy.account_balance = strategy.server_get_account_balance()
+                strategy.account_available_balance = strategy.account_balance
             strategy.server_check_and_recreate_missing_tp_sl()
             try:
                 strategy.server_maybe_btc_yesterday_yang_flatten_at_new_utc_day()
@@ -5223,7 +6581,12 @@ def main():
             time.sleep(60)
             # 每分钟输出一次状态
             if is_running:
-                logging.info(f"💓 系统运行中... 持仓: {len(strategy.positions)}, 余额: ${strategy.account_balance:.2f}")
+                if strategy is not None and getattr(strategy, 'api_configured', False):
+                    strategy.server_sync_wallet_snapshot()
+                logging.info(
+                    f"💓 系统运行中... 持仓: {len(strategy.positions)}, "
+                    f"余额: ${strategy.account_balance:.2f}  可用余额: ${strategy.account_available_balance:.2f}"
+                )
                 # 🔧 强制刷新日志
                 for handler in logging.getLogger().handlers:
                     if hasattr(handler, 'flush'):
@@ -5241,11 +6604,10 @@ def main():
 
 
 def daily_report_loop():
-    """每日报告循环（每天早上8点发送报告）"""
+    """每个 UTC 自然日自动发送至多一次；本日已发过则长休眠至下一 UTC 日（不按小时反复检查）。"""
     global is_running
 
-    logging.info("📧 每日报告线程已启动")
-    last_report_date = None
+    logging.info("📧 每日报告线程已启动（每 UTC 日最多自动 1 次）")
 
     while True:
         try:
@@ -5253,25 +6615,22 @@ def daily_report_loop():
                 time.sleep(60)
                 continue
 
-            # 获取当前UTC时间
             now = datetime.now(timezone.utc)
             current_date = now.date()
+            last_sent = _daily_report_load_last_sent_date()
 
-            # 检查是否是新的一天且时间在早上8点之后
-            # 北京时间8点 = UTC时间0点
-            if current_date != last_report_date and now.hour >= 0:
-                logging.info("📧 开始生成每日交易报告...")
+            if last_sent == current_date:
+                time.sleep(_seconds_sleep_until_after_next_utc_midnight(now))
+                continue
 
-                # 发送每日报告
-                send_daily_report()
-
-                # 标记已发送
-                last_report_date = current_date
-
-                logging.info(f"📧 每日报告已发送 ({current_date})")
-
-            # 每小时检查一次
-            time.sleep(3600)  # 1小时
+            logging.info("📧 开始生成每日交易报告...")
+            ok = send_daily_report()
+            if ok:
+                logging.info(f"📧 每日报告已完成 ({current_date})")
+                time.sleep(_seconds_sleep_until_after_next_utc_midnight(datetime.now(timezone.utc)))
+            else:
+                logging.warning("⚠️ 日报未成功落盘，1 小时后重试")
+                time.sleep(3600)
 
         except Exception as e:
             logging.error(f"❌ 每日报告循环异常: {e}")

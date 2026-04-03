@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="params-page-html">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>参数编辑 — AE</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=38">
+</head>
+<body class="params-page">
+{% set active_nav = 'params' %}
+<div class="app-shell">
+{% include '_nav.html' %}
+<div class="app-body app-body-params">
+    <header class="params-page-header">
+        <div class="params-page-header-inner">
+            <h1>参数编辑</h1>
+            <p class="params-page-lead">左栏：策略表单（分组 + 两列字段）与<strong>取值参考</strong>；右栏：<strong>Binance API</strong>。字段过多时仅在表单项区域滚动。</p>
+            <div class="params-page-save-note" aria-label="保存说明（策略与 API 等全部参数）">
+                <ul class="params-save-checklist">
+                    <li>点顶栏<strong>保存</strong>将策略表单写入 <code>config.ini</code> 并<strong>热应用</strong>；右栏「保存到 config.ini」仅负责 API 密钥（同一文件，一般无需重启服务）。</li>
+                    <li><strong>已持仓与交易所挂单</strong>不会随改参自动调整。</li>
+                    <li>保存会重写配置文件，注释可能丢失，请先备份。环境变量 <code>BINANCE_API_*</code> 可覆盖文件中的密钥。</li>
+                </ul>
+            </div>
+        </div>
+    </header>
+    <main class="main-content params-edit-main">
+        <div class="params-narrow-switch" id="params-narrow-switch" aria-label="窄屏切换主栏">
+            <button type="button" class="params-narrow-btn is-active" data-narrow-panel="left" id="params-narrow-left">策略表单</button>
+            <button type="button" class="params-narrow-btn" data-narrow-panel="right" id="params-narrow-right">Binance API</button>
+        </div>
+        <div class="params-col params-col-left is-narrow-active" id="params-col-left">
+            <div class="params-form-card">
+                <div class="params-form-toolbar">
+                    <span class="params-toolbar-title">策略参数</span>
+                    <div class="params-toolbar-actions">
+                        <button type="submit" form="form-config-editable" class="btn btn-success btn-sm" id="btn-save-toolbar">保存</button>
+                        <a href="{{ url_for('index') }}" class="btn btn-secondary btn-sm ae-nav-monitor">监控</a>
+                    </div>
+                </div>
+                <div id="params-status" class="params-status" role="status" aria-live="polite"></div>
+                <div class="params-form-tablist" role="tablist" aria-label="策略分组">
+                    <button type="button" class="params-tab is-active" role="tab" aria-selected="true" aria-controls="panel-strategy" id="tab-strategy" data-panel="panel-strategy">STRATEGY</button>
+                    <button type="button" class="params-tab" role="tab" aria-selected="false" aria-controls="panel-signal" id="tab-signal" data-panel="panel-signal">SIGNAL</button>
+                    <button type="button" class="params-tab" role="tab" aria-selected="false" aria-controls="panel-risk" id="tab-risk" data-panel="panel-risk">RISK</button>
+                </div>
+                <form id="form-config-editable" class="params-form">
+                    <div class="params-form-panels">
+                        <div class="params-panel is-active" id="panel-strategy" role="tabpanel" aria-labelledby="tab-strategy">
+                            <section class="params-section" id="sec-strategy" aria-labelledby="params-strategy-title">
+                                <h2 class="params-section-head" id="params-strategy-title">核心策略 <span class="params-legend-en">STRATEGY</span></h2>
+                                <div class="params-fields">
+                                    <div class="params-row">
+                                        <label class="params-label" for="STRATEGY_leverage">杠杆 <span class="params-key">leverage</span></label>
+                                        <input class="form-input params-input" type="number" name="STRATEGY_leverage" id="STRATEGY_leverage" min="1" max="125" step="1">
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="STRATEGY_position_size_ratio">单仓比例（0–1） <span class="params-key">position_size_ratio</span></label>
+                                        <input class="form-input params-input" type="number" name="STRATEGY_position_size_ratio" id="STRATEGY_position_size_ratio" min="0.001" max="1" step="0.001">
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="STRATEGY_max_positions">最大持仓 <span class="params-key">max_positions</span></label>
+                                        <input class="form-input params-input" type="number" name="STRATEGY_max_positions" id="STRATEGY_max_positions" min="1" max="500" step="1">
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="STRATEGY_max_daily_entries">每日最大建仓 <span class="params-key">max_daily_entries</span></label>
+                                        <input class="form-input params-input" type="number" name="STRATEGY_max_daily_entries" id="STRATEGY_max_daily_entries" min="0" max="500" step="1">
+                                    </div>
+                                    <div class="params-row params-row-check">
+                                        <label class="params-label" for="STRATEGY_enable_hourly_entry_limit">每小时最多 1 笔 <span class="params-key">enable_hourly_entry_limit</span></label>
+                                        <label class="params-check-line"><input type="checkbox" id="STRATEGY_enable_hourly_entry_limit"> <span>启用</span></label>
+                                    </div>
+                                    <div class="params-row params-row-full">
+                                        <label class="params-label" for="STRATEGY_max_opens_per_scan">单次扫描最多开仓（0=不限制） <span class="params-key">max_opens_per_scan</span></label>
+                                        <input class="form-input params-input" type="number" name="STRATEGY_max_opens_per_scan" id="STRATEGY_max_opens_per_scan" min="0" max="500" step="1">
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+                        <div class="params-panel" id="panel-signal" role="tabpanel" aria-labelledby="tab-signal">
+                            <section class="params-section" id="sec-signal" aria-labelledby="params-signal-title">
+                                <h2 class="params-section-head" id="params-signal-title">信号过滤 <span class="params-legend-en">SIGNAL</span></h2>
+                                <div class="params-fields">
+                                    <div class="params-row">
+                                        <label class="params-label" for="SIGNAL_sell_surge_threshold">卖量暴涨下限 <span class="params-key">sell_surge_threshold</span></label>
+                                        <input class="form-input params-input" type="number" name="SIGNAL_sell_surge_threshold" id="SIGNAL_sell_surge_threshold" min="0.0001" step="any">
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="SIGNAL_sell_surge_max">卖量暴涨上限 <span class="params-key">sell_surge_max</span></label>
+                                        <input class="form-input params-input" type="number" name="SIGNAL_sell_surge_max" id="SIGNAL_sell_surge_max" min="0.0001" step="any">
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+                        <div class="params-panel" id="panel-risk" role="tabpanel" aria-labelledby="tab-risk">
+                            <section class="params-section" id="sec-risk" aria-labelledby="params-risk-title">
+                                <h2 class="params-section-head" id="params-risk-title">止盈止损与持仓 <span class="params-legend-en">RISK</span></h2>
+                                <div class="params-fields">
+                                    <div class="params-row">
+                                        <label class="params-label" for="RISK_strong_coin_tp_pct">强势止盈 % <span class="params-key">strong_coin_tp_pct</span></label>
+                                        <input class="form-input params-input" type="number" name="RISK_strong_coin_tp_pct" id="RISK_strong_coin_tp_pct" min="0.1" max="99" step="0.1">
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="RISK_medium_coin_tp_pct">中势止盈 % <span class="params-key">medium_coin_tp_pct</span></label>
+                                        <input class="form-input params-input" type="number" name="RISK_medium_coin_tp_pct" id="RISK_medium_coin_tp_pct" min="0.1" max="99" step="0.1">
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="RISK_weak_coin_tp_pct">弱势止盈 % <span class="params-key">weak_coin_tp_pct</span></label>
+                                        <input class="form-input params-input" type="number" name="RISK_weak_coin_tp_pct" id="RISK_weak_coin_tp_pct" min="0.1" max="99" step="0.1">
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="RISK_stop_loss_pct">止损 % <span class="params-key">stop_loss_pct</span></label>
+                                        <input class="form-input params-input" type="number" name="RISK_stop_loss_pct" id="RISK_stop_loss_pct" min="0.1" max="99" step="0.1">
+                                    </div>
+                                    <div class="params-row params-row-check">
+                                        <label class="params-label" for="RISK_enable_max_gain_24h_exit">24h 涨幅超阈值平仓 <span class="params-key">enable_max_gain_24h_exit</span></label>
+                                        <label class="params-check-line"><input type="checkbox" id="RISK_enable_max_gain_24h_exit"> <span>启用</span></label>
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="RISK_max_gain_24h_threshold">24h 涨幅阈值 % <span class="params-key">max_gain_24h_threshold</span></label>
+                                        <input class="form-input params-input" type="number" name="RISK_max_gain_24h_threshold" id="RISK_max_gain_24h_threshold" min="0.01" max="100" step="0.01">
+                                    </div>
+                                    <div class="params-row">
+                                        <label class="params-label" for="RISK_max_hold_hours">最大持仓时长（小时） <span class="params-key">max_hold_hours</span></label>
+                                        <input class="form-input params-input" type="number" name="RISK_max_hold_hours" id="RISK_max_hold_hours" min="1" max="720" step="1">
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="params-left-ref" aria-label="策略参数取值参考">
+                <h2 class="params-left-ref-head">取值参考</h2>
+                <div class="params-left-ref-body">
+                    <table class="params-ref-table">
+                        <thead>
+                            <tr><th>段</th><th>要点</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span class="params-ref-tag">STRATEGY</span></td>
+                                <td>杠杆 1–125；单仓比 (0,1]；持仓 1–500；日建仓/单次开仓 0–500</td>
+                            </tr>
+                            <tr>
+                                <td><span class="params-ref-tag">SIGNAL</span></td>
+                                <td>卖量上限 &gt; 下限，均为正</td>
+                            </tr>
+                            <tr>
+                                <td><span class="params-ref-tag">RISK</span></td>
+                                <td>止盈/止损 % 0.1–99；24h 阈值 % 0.01–100；持仓时长 1–720h</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <p class="params-ref-foot">与服务端校验一致；越界将提示错误。</p>
+                </div>
+            </div>
+        </div>
+        <aside class="params-col params-col-right" id="params-col-right" aria-label="Binance API">
+            <div class="params-side-shell params-side-shell-single">
+                <div class="params-side-card params-side-card-flat params-side-card-api">
+                    <h2 class="params-side-head">Binance API</h2>
+                    <div class="params-side-body">
+                        <div id="binance-cred-status" class="params-binance-status" role="status"></div>
+                        <p id="binance-env-note" class="params-side-note params-binance-env-note" hidden></p>
+                        <div class="params-row params-cred-row">
+                            <label class="params-label" for="binance-api-key-input">API Key</label>
+                            <div class="params-cred-input-wrap">
+                                <input type="password" class="form-input params-input" id="binance-api-key-input" autocomplete="off" placeholder="填写新密钥或先测试">
+                                <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-api-key" title="复制当前输入框内容">复制</button>
+                            </div>
+                        </div>
+                        <div class="params-row params-cred-row">
+                            <label class="params-label" for="binance-api-secret-input">Secret</label>
+                            <div class="params-cred-input-wrap">
+                                <input type="password" class="form-input params-input" id="binance-api-secret-input" autocomplete="off" placeholder="填写新密钥或先测试">
+                                <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-api-secret" title="复制当前输入框内容">复制</button>
+                            </div>
+                        </div>
+                        <div class="params-binance-hint-row">
+                            <p class="params-binance-mask-hint" id="binance-mask-hint">未加载</p>
+                            <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-key-tail" title="复制 API Key 尾号说明（仅标识用）">复制尾号</button>
+                        </div>
+                        <div class="params-binance-actions">
+                            <button type="button" class="btn btn-primary btn-sm" id="btn-binance-test">测试连通</button>
+                            <button type="button" class="btn btn-success btn-sm" id="btn-binance-save">保存到 config.ini</button>
+                        </div>
+                        <p class="params-side-note params-side-note-tight">明文密钥不会下发；复制针对<strong>输入框内</strong>文本。</p>
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </main>
+</div>
+</div>
+<script src="{{ url_for('static', filename='js/params.js') }}?v=8"></script>
+</body>
+</html>
