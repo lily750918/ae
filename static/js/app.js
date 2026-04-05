@@ -596,7 +596,7 @@
 
   window.downloadDailyReport = downloadDailyReport;
 
-  const TRADE_PAGE_SIZE = 10;
+  const TRADE_PAGE_SIZE = 8;
   let _tradeAllRows = [];
   let _tradePage = 0;
 
@@ -796,7 +796,7 @@
   };
 
   // —— 信号历史 ——
-  const SIGNAL_PAGE_SIZE = 10;
+  const SIGNAL_PAGE_SIZE = 9;
   let _signalAllRows = [];
   let _signalPage = 0;
 

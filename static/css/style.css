@@ -1,35 +1,41 @@
 /* AE Monitor — 深色交易台风格 */
 
 :root {
-  --bg-deep: #0b0f14;
-  --bg-surface: #121824;
-  --bg-elevated: #1a2230;
-  --border: rgba(94, 123, 168, 0.22);
+  --bg-deep: #07090e;
+  --bg-surface: rgba(18, 24, 36, 0.65);
+  --bg-elevated: rgba(26, 34, 48, 0.75);
+  --border: rgba(94, 123, 168, 0.15);
   --border-strong: rgba(61, 139, 253, 0.35);
-  --text: #e8eef6;
-  --text-muted: #8a9bb0;
+  --text: #f1f5f9;
+  --text-muted: #94a3b8;
   --accent: #3d8bfd;
   --accent-dim: rgba(61, 139, 253, 0.15);
-  --success: #34d399;
-  --success-dim: rgba(52, 211, 153, 0.12);
-  --danger: #f87171;
-  --danger-dim: rgba(248, 113, 113, 0.12);
-  --warning: #fbbf24;
-  --radius: 10px;
-  --radius-sm: 6px;
-  --shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
-  --font: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
-  --mono: ui-monospace, "SF Mono", "Cascadia Code", monospace;
-  /* 交易/信号记录表：单行略收紧（与持仓表行高分开，避免持仓区被压扁） */
-  --history-row-height: 2.08rem;
-  /* 当前持仓表：行高略大，减少表体内滚动 */
+  --success: #10b981;
+  --success-dim: rgba(16, 185, 129, 0.12);
+  --danger: #ef4444;
+  --danger-dim: rgba(239, 68, 68, 0.12);
+  --warning: #f59e0b;
+  --radius: 16px;
+  --radius-sm: 8px;
+  --shadow: 0 10px 40px -10px rgba(0,0,0,0.5);
+  --font: "Outfit", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", monospace;
+  --trade-row-height: 2.08rem;
+  --signal-row-height: 2.08rem;
   --position-row-height: 2.26rem;
-  /* 表头 + 10 行数据区 + 分页条（避免切换页/条数少时整块上下跳） */
-  --history-tab-min-h: calc(2.65rem + 10 * var(--history-row-height) + 2.5rem);
-  /* 持仓表格可视高度（表头 + 约 10 行），图表区与之对齐 */
+  --trade-tab-min-h: calc(2.65rem + 8 * var(--trade-row-height) + 2.5rem);
+  --signal-tab-min-h: calc(2.65rem + 9 * var(--signal-row-height) + 2.5rem);
   --monitor-positions-body-height: calc(4.95rem + 10 * var(--position-row-height));
-  /* 图表分列总高 = 列标题行 + 与持仓表体同高 */
   --monitor-chart-split-height: calc(1.75rem + var(--monitor-positions-body-height));
+  
+  /* New Variables */
+  --glass-bg: rgba(18, 24, 36, 0.45);
+  --glass-border: rgba(255, 255, 255, 0.06);
+  --glass-highlight: inset 0 1px 0 0 rgba(255, 255, 255, 0.05);
+  --glow-accent: 0 0 20px rgba(61, 139, 253, 0.3);
+  --glow-success: 0 0 20px rgba(16, 185, 129, 0.3);
+  --glow-danger: 0 0 20px rgba(239, 68, 68, 0.3);
+  --shadow-layered: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06), 0 20px 25px -5px rgba(0, 0, 0, 0.3);
 }
 
 *,
@@ -49,9 +55,11 @@ body {
   min-height: 100dvh;
   font-family: var(--font);
   background: var(--bg-deep);
-  background-image:
-    radial-gradient(ellipse 120% 80% at 50% -20%, rgba(61, 139, 253, 0.08), transparent 55%),
-    radial-gradient(ellipse 80% 50% at 100% 100%, rgba(52, 211, 153, 0.04), transparent 45%);
+  background-image: 
+    radial-gradient(circle at 15% 50%, rgba(61, 139, 253, 0.06), transparent 40%),
+    radial-gradient(circle at 85% 30%, rgba(16, 185, 129, 0.04), transparent 40%),
+    radial-gradient(circle at 50% 100%, rgba(239, 68, 68, 0.03), transparent 40%);
+  background-attachment: fixed;
   color: var(--text);
   line-height: 1.5;
 }
@@ -1321,6 +1329,7 @@ body.params-page .params-page-lead {
   color: var(--text-muted);
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
 
 .positions-container tbody td {
@@ -1741,9 +1750,9 @@ body.params-page .params-page-lead {
 
 /* 默认：日志区最小高度与交易表一致；宽屏下由 @media 改为弹性填满列 */
 .logs-section-right .logs-content {
-  min-height: var(--history-tab-min-h);
-  height: var(--history-tab-min-h);
-  max-height: var(--history-tab-min-h);
+  min-height: var(--trade-tab-min-h);
+  height: var(--trade-tab-min-h);
+  max-height: var(--trade-tab-min-h);
 }
 
 .logs-hint {
@@ -2028,7 +2037,7 @@ body.params-page .params-page-lead {
 
 .trade-history-table .trade-col-pnl-pct,
 .trade-history-table .trade-cell-pnl-pct {
-  width: 5%;
+  width: 7%;
 }
 
 .trade-history-table .trade-col-reason,
@@ -2042,7 +2051,13 @@ body.params-page .params-page-lead {
   min-width: 4.25rem;
 }
 
-.trade-history-table th.trade-col-dur {
+.trade-history-table th.trade-col-dur,
+.trade-history-table th.trade-col-pnl-pct,
+.trade-history-table th.trade-col-pnl,
+.trade-history-table th.trade-col-dir,
+.trade-history-table th.trade-col-price,
+.trade-history-table th.trade-col-symbol,
+.trade-history-table th.trade-col-reason {
   white-space: nowrap;
 }
 
@@ -2078,8 +2093,8 @@ body.params-page .params-page-lead {
 .history-pad-row .history-pad-cell {
   padding: 0.35rem 0.75rem;
   border-bottom: 1px solid var(--border);
-  height: var(--history-row-height);
-  max-height: var(--history-row-height);
+  height: var(--trade-row-height);
+  max-height: var(--trade-row-height);
   overflow: hidden;
   color: transparent;
   user-select: none;
@@ -2106,6 +2121,16 @@ body.params-page .params-page-lead {
 }
 
 /* 宽屏：整页纵向不滚动，仅在持仓表 / 交易·信号 / 日志 内滚动 */
+/* 交易/信号记录：窄屏下分别控制最小高度（交易 8 行，信号 9 行） */
+#trade-history-container {
+  min-height: calc(8 * var(--trade-row-height));
+  overflow: auto;
+}
+#signal-history-container {
+  min-height: calc(9 * var(--signal-row-height));
+  overflow: auto;
+}
+
 @media (min-width: 961px) {
   html {
     height: 100%;
@@ -2240,4 +2265,409 @@ body.params-page .params-page-lead {
     max-height: 42vh;
     overflow-y: auto;
   }
+}
+
+
+/* =========================================
+   AE MONITOR REDESIGN OVERRIDES
+   ========================================= */
+
+/* Typography Enhancements */
+h1, h2, h3, h4, h5, h6, .app-sidebar-brand, .chart-col-title, .params-toolbar-title {
+  font-family: "Outfit", var(--font);
+  letter-spacing: -0.01em;
+}
+
+.status-item span:not(.status-dot), .pnl-value, .trade-cell-price, .trade-cell-pnl, .trade-cell-pnl-pct, .trade-cell-dur, .history-time-cell, .form-value, .params-input, .lwc-tag, .badge {
+  font-family: var(--mono);
+}
+
+/* Glassmorphism Cards */
+.section, .positions-container, .logs-container, .position-chart-container, .params-section, .params-side-card, .params-form-card, .params-left-ref, .tv-chart-wrap, .params-page-save-note {
+  background: var(--glass-bg) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border) !important;
+  box-shadow: var(--shadow-layered), var(--glass-highlight) !important;
+  border-radius: var(--radius);
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+/* Buttons */
+.btn {
+  background: linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0) 100%), var(--bg-elevated);
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.btn::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(180deg, rgba(255,255,255,0.1) 0%, rgba(255,255,255,0) 100%);
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.1);
+}
+
+.btn:hover:not(:disabled)::after {
+  opacity: 1;
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px) scale(0.98);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+}
+
+.btn-primary {
+  background: linear-gradient(180deg, rgba(61, 139, 253, 0.8) 0%, rgba(37, 99, 235, 0.9) 100%);
+  border-color: rgba(96, 165, 250, 0.5);
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(37, 99, 235, 0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, rgba(96, 165, 250, 0.9) 0%, rgba(59, 130, 246, 1) 100%);
+  box-shadow: var(--glow-accent), inset 0 1px 0 rgba(255,255,255,0.3);
+  color: #fff;
+}
+
+.btn-success {
+  background: linear-gradient(180deg, rgba(16, 185, 129, 0.8) 0%, rgba(5, 150, 105, 0.9) 100%);
+  border-color: rgba(52, 211, 153, 0.5);
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(5, 150, 105, 0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+}
+
+.btn-success:hover:not(:disabled) {
+  background: linear-gradient(180deg, rgba(52, 211, 153, 0.9) 0%, rgba(16, 185, 129, 1) 100%);
+  box-shadow: var(--glow-success), inset 0 1px 0 rgba(255,255,255,0.3);
+  color: #fff;
+}
+
+.btn-danger {
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.8) 0%, rgba(220, 38, 38, 0.9) 100%);
+  border-color: rgba(248, 113, 113, 0.5);
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(220, 38, 38, 0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: linear-gradient(180deg, rgba(248, 113, 113, 0.9) 0%, rgba(239, 68, 68, 1) 100%);
+  box-shadow: var(--glow-danger), inset 0 1px 0 rgba(255,255,255,0.3);
+  color: #fff;
+}
+
+/* Tables */
+.positions-container table, .trade-history-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+}
+
+.positions-container thead th {
+  background: rgba(18, 24, 36, 0.8) !important;
+  backdrop-filter: blur(8px);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  border-bottom: 1px solid var(--glass-border) !important;
+  font-family: "Outfit", var(--font);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  padding: 0.55rem 0.6rem !important;
+}
+
+.positions-container tbody tr {
+  transition: background-color 0.2s ease, transform 0.2s ease;
+}
+
+.positions-container tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.positions-container tbody tr:hover {
+  background: rgba(61, 139, 253, 0.08) !important;
+  transform: scale(1.001);
+}
+
+.positions-container tbody td {
+  padding: 0.6rem 1rem !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03) !important;
+}
+
+/* Sidebar */
+.app-sidebar {
+  background: rgba(11, 15, 20, 0.6) !important;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 1px solid var(--glass-border) !important;
+}
+
+.app-sidebar-brand {
+  background: linear-gradient(90deg, #fff, #a5c8ff);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: 0 2px 10px rgba(61, 139, 253, 0.2);
+}
+
+.app-sidebar-brand::after {
+  background: linear-gradient(90deg, var(--accent), #8b5cf6, transparent) !important;
+  height: 3px !important;
+  box-shadow: 0 0 8px rgba(61, 139, 253, 0.5);
+}
+
+.app-sidebar-link {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.app-sidebar-link[href="/"]::before {
+  content: "📊";
+  font-size: 1.1em;
+  filter: grayscale(1) brightness(1.5);
+  transition: filter 0.3s;
+}
+
+.app-sidebar-link[href="/params"]::before {
+  content: "⚙️";
+  font-size: 1.1em;
+  filter: grayscale(1) brightness(1.5);
+  transition: filter 0.3s;
+}
+
+.app-sidebar-link:hover::before, .app-sidebar-link.is-active::before {
+  filter: grayscale(0) brightness(1);
+}
+
+.app-sidebar-link.is-active {
+  background: linear-gradient(90deg, rgba(61, 139, 253, 0.15), transparent) !important;
+  border: 1px solid var(--glass-border) !important;
+  border-left: 3px solid var(--accent) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+}
+
+/* Status Indicators */
+.status-dot {
+  box-shadow: 0 0 0 2px rgba(18, 24, 36, 0.8) !important;
+}
+
+.status-dot.running {
+  box-shadow: 0 0 0 2px rgba(18, 24, 36, 0.8), 0 0 12px var(--success) !important;
+  animation: pulse-glow-success 2s cubic-bezier(0.4, 0, 0.6, 1) infinite !important;
+}
+
+@keyframes pulse-glow-success {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 2px rgba(18, 24, 36, 0.8), 0 0 12px rgba(16, 185, 129, 0.6); }
+  50% { opacity: 0.8; box-shadow: 0 0 0 2px rgba(18, 24, 36, 0.8), 0 0 24px rgba(16, 185, 129, 0.9); }
+}
+
+/* Modals */
+.modal {
+  background: rgba(5, 8, 12, 0.4) !important;
+  backdrop-filter: blur(12px) !important;
+  -webkit-backdrop-filter: blur(12px) !important;
+}
+
+.modal-content {
+  background: var(--glass-bg) !important;
+  border: 1px solid var(--glass-border) !important;
+  box-shadow: var(--shadow-layered), 0 0 40px rgba(61, 139, 253, 0.15), inset 0 1px 0 rgba(255,255,255,0.1) !important;
+  animation: modal-pop 0.4s cubic-bezier(0.16, 1, 0.3, 1) !important;
+}
+
+@keyframes modal-pop {
+  0% { opacity: 0; transform: scale(0.9) translateY(20px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.modal-header {
+  background: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--glass-border) !important;
+}
+
+.modal-footer {
+  background: rgba(0, 0, 0, 0.2) !important;
+  border-top: 1px solid var(--glass-border) !important;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+/* Inputs & Forms */
+.form-input, .params-input {
+  background: rgba(0, 0, 0, 0.2) !important;
+  border: 1px solid var(--glass-border) !important;
+  transition: all 0.2s ease;
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.form-input:focus, .params-input:focus {
+  background: rgba(0, 0, 0, 0.3) !important;
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px rgba(61, 139, 253, 0.2), inset 0 2px 4px rgba(0,0,0,0.1) !important;
+}
+
+/* Tabs */
+.tab-btn {
+  position: relative;
+  overflow: hidden;
+}
+
+.tab-btn::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 50%;
+  width: 0; height: 2px;
+  background: var(--accent);
+  transition: all 0.3s ease;
+  transform: translateX(-50%);
+}
+
+.tab-btn-active::after {
+  width: 100%;
+  box-shadow: 0 -2px 10px var(--accent);
+}
+
+.tab-btn-active {
+  border-bottom-color: transparent !important;
+}
+
+.params-tab {
+  background: rgba(0, 0, 0, 0.2) !important;
+  border: 1px solid var(--glass-border) !important;
+  transition: all 0.2s ease;
+}
+
+.params-tab.is-active {
+  background: linear-gradient(180deg, rgba(61, 139, 253, 0.2) 0%, rgba(61, 139, 253, 0.05) 100%) !important;
+  border-color: var(--accent) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.1);
+}
+
+/* Header */
+.header {
+  background: rgba(18, 24, 36, 0.7) !important;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--glass-border) !important;
+}
+
+.params-page-header {
+  background: rgba(18, 24, 36, 0.7) !important;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--glass-border) !important;
+}
+
+/* Badges */
+.badge {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.1);
+}
+
+.badge-long {
+  background: linear-gradient(180deg, rgba(16, 185, 129, 0.2) 0%, rgba(16, 185, 129, 0.1) 100%) !important;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.badge-short {
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.2) 0%, rgba(239, 68, 68, 0.1) 100%) !important;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+/* Focus Rings for Accessibility */
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Smooth transitions for interactive elements */
+a, button, input, select, textarea {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Fix for params page layout */
+.params-section-head, .params-left-ref-head, .params-side-head {
+  background: rgba(255, 255, 255, 0.02) !important;
+  border-bottom: 1px solid var(--glass-border) !important;
+}
+
+.params-form-toolbar {
+  background: transparent !important;
+  border-bottom: 1px solid var(--glass-border) !important;
+}
+
+.export-bar {
+  background: rgba(0, 0, 0, 0.2) !important;
+  border: 1px solid var(--glass-border) !important;
+}
+
+.lwc-toolbar {
+  background: rgba(255, 255, 255, 0.02) !important;
+  border-bottom: 1px solid var(--glass-border) !important;
+}
+
+/* Disabled Buttons */
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(100%);
+  box-shadow: none !important;
+  transform: none !important;
+}
+.btn:disabled::after {
+  display: none;
+}
+
+/* Sidebar Action Buttons */
+.app-sidebar-action-btn {
+  background: rgba(255, 255, 255, 0.03) !important;
+  border: 1px solid rgba(255, 255, 255, 0.05) !important;
+  box-shadow: none !important;
+}
+.app-sidebar-action-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08) !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+.app-sidebar-action-btn.btn-success {
+  color: var(--success);
+}
+.app-sidebar-action-btn.btn-danger {
+  color: var(--danger);
+}
+.app-sidebar-action-btn.btn-primary {
+  color: var(--accent);
+}
+
+/* Ensure all table cells use monospace for numbers */
+.positions-container tbody td, .trade-history-table tbody td {
+  font-family: var(--mono);
 }
