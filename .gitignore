@@ -19,7 +19,7 @@ dist-ssr/
 .ruff_cache/
 .pytest_cache/
 logs/
-positions_records.json
+positions_record.json
 trade_history.json
 signal_history.json
 hm1l/
