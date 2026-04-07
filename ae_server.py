@@ -1463,9 +1463,14 @@ class AutoExchangeStrategy:
 
         # intraday_buy_surge_ratio 缓存，key=(symbol, hour_str)，每小时自动失效
         self._intraday_ratio_cache: Dict[tuple, float] = {}
+        self._intraday_ratio_lock = threading.Lock()
 
         # 加载现有持仓
-        self.server_load_existing_positions()
+        self.positions_loaded = False  # 标记是否已成功从交易所加载持仓
+        try:
+            self.server_load_existing_positions()
+        except Exception as e:
+            logging.error(f"❌ 启动时加载持仓失败: {e}，将在监控循环中重试")
 
         logging.info("✅ 策略引擎初始化完成")
         logging.info(
@@ -1633,6 +1638,7 @@ class AutoExchangeStrategy:
         """启动时从交易所加载现有持仓（并从文件恢复真实建仓时间）- 服务器版本"""
         if not getattr(self, "api_configured", False) or self.client is None:
             logging.warning("🔕 未配置 API：跳过从交易所加载持仓")
+            self.positions_loaded = True  # 无需加载
             return
         try:
             logging.info("🔍 加载交易所现有持仓...")
@@ -1640,7 +1646,7 @@ class AutoExchangeStrategy:
             # 先读取持仓记录文件
             positions_record = self.server_load_positions_record()
 
-            # 🔧 API调用重试机制
+            # API调用重试机制
             positions_info = None
             max_retries = 5
             retry_delay = 3  # 秒
@@ -1660,7 +1666,8 @@ class AutoExchangeStrategy:
                         logging.error(
                             f"❌ 尝试{max_retries}次后仍无法获取持仓信息: {e}"
                         )
-                        raise
+                        self.positions_loaded = False
+                        return
 
             if positions_info is None:
                 raise Exception("无法从交易所获取持仓信息")
@@ -1852,8 +1859,11 @@ class AutoExchangeStrategy:
                 self.last_entry_date = today
                 logging.info(f"📅 恢复今日建仓计数: {today_count}")
 
+            self.positions_loaded = True
+
         except Exception as e:
             logging.error(f"❌ 加载现有持仓失败: {e}")
+            self.positions_loaded = False
 
     def server_load_positions_record(self) -> Dict:
         """从文件加载持仓记录（兼容旧版本数据，自动补充缺失的ID字段）- 服务器版本"""
@@ -2118,11 +2128,12 @@ class AutoExchangeStrategy:
 
             # 以 (symbol, 小时) 为 key 做缓存，同一小时内重复计算直接返回
             cache_key = (symbol, signal_dt.strftime("%Y-%m-%d %H"))
-            if cache_key in self._intraday_ratio_cache:
-                logging.debug(
-                    f"📊 {symbol} 当日买量倍数命中缓存: {self._intraday_ratio_cache[cache_key]:.2f}倍"
-                )
-                return self._intraday_ratio_cache[cache_key]
+            with self._intraday_ratio_lock:
+                if cache_key in self._intraday_ratio_cache:
+                    logging.debug(
+                        f"📊 {symbol} 当日买量倍数命中缓存: {self._intraday_ratio_cache[cache_key]:.2f}倍"
+                    )
+                    return self._intraday_ratio_cache[cache_key]
 
             # 计算时间范围：信号前12小时
             start_time = signal_dt - timedelta(hours=12)
@@ -2166,16 +2177,17 @@ class AutoExchangeStrategy:
                 logging.debug(f"⚠️ {symbol} 未计算出有效的当日买量倍数（max_ratio=0）")
 
             # 写入缓存，同一小时内重复调用直接命中
-            self._intraday_ratio_cache[cache_key] = max_ratio
-            # 防止缓存无限增长，超过 500 条时清空过期条目
-            if len(self._intraday_ratio_cache) > 500:
-                cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-                cutoff_str = cutoff.strftime("%Y-%m-%d %H")
-                self._intraday_ratio_cache = {
-                    k: v
-                    for k, v in self._intraday_ratio_cache.items()
-                    if k[1] >= cutoff_str
-                }
+            with self._intraday_ratio_lock:
+                self._intraday_ratio_cache[cache_key] = max_ratio
+                # 防止缓存无限增长，超过 500 条时清空过期条目
+                if len(self._intraday_ratio_cache) > 500:
+                    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+                    cutoff_str = cutoff.strftime("%Y-%m-%d %H")
+                    self._intraday_ratio_cache = {
+                        k: v
+                        for k, v in self._intraday_ratio_cache.items()
+                        if k[1] >= cutoff_str
+                    }
             return max_ratio
 
         except Exception as e:
@@ -2403,6 +2415,10 @@ class AutoExchangeStrategy:
 
                     # 上一小时数据
                     hour_kline = klines[0]
+                    # 校验K线时间戳，防止API因历史数据缺失顺延返回"当前小时"被误认为"上一小时"
+                    if int(hour_kline[0]) != check_hour_ms:
+                        return None
+
                     hour_volume = float(hour_kline[5])  # 总成交量
                     hour_active_buy = float(hour_kline[9])  # 主动买入量
                     hour_sell_volume = hour_volume - hour_active_buy
@@ -2481,8 +2497,8 @@ class AutoExchangeStrategy:
                     logging.warning(f"扫描 {symbol} 异常: {e}")
                     return None
 
-            # 并发扫描所有交易对（max_workers=20 控制并发，避免触发 Binance 频率限制）
-            with ThreadPoolExecutor(max_workers=20) as executor:
+            # 并发扫描所有交易对（max_workers=10 控制并发，匹配底层连接池以免阻塞）
+            with ThreadPoolExecutor(max_workers=10) as executor:
                 futures_map = {executor.submit(_scan_one, sym): sym for sym in symbols}
                 for future in as_completed(futures_map):
                     try:
@@ -6170,26 +6186,28 @@ def get_logs():
                     if len(main_logs) > lines_count
                     else main_logs
                 )
-                last_lines = list(reversed(chunk))
+                last_lines = [ln.strip() for ln in reversed(chunk) if ln.strip()]
             else:
-                # 多读一些再过滤；分桶合并，避免大量 INFO/WARNING 占满条数把最近的 ERROR 挤出（如获取余额超时）
+                # 多读一些再过滤；分桶保留足够多重要信息避免被 INFO 淹没
                 raw_take = min(len(main_logs), max(lines_count * 40, 600))
                 rev = list(reversed(main_logs[-raw_take:]))
-                errs: List[str] = []
-                warns: List[str] = []
-                infos: List[str] = []
-                for ln in rev:
+                errs = []
+                warns = []
+                infos = []
+                for i, ln in enumerate(rev):
                     st = ln.strip()
                     if not st:
                         continue
                     if " - ERROR - " in st or " - CRITICAL - " in st:
-                        errs.append(st)
+                        errs.append((i, st))
                     elif " - WARNING - " in st:
-                        warns.append(st)
+                        warns.append((i, st))
                     elif _log_line_ok_for_monitor(st):
-                        infos.append(st)
+                        infos.append((i, st))
                 merged = (errs + warns + infos)[:lines_count]
-                last_lines = merged
+                # 重新按原来的出现顺序（最新到最老）稳定排序，恢复时间线的连续性
+                merged.sort(key=lambda x: x[0])
+                last_lines = [item[1] for item in merged]
             log_file_name = os.path.basename(latest_log)
 
         position_snippet: List[str] = []
@@ -8000,6 +8018,18 @@ def monitor_loop():
 
             # BTC 昨日阳线 → 新 UTC 日一刀切空仓（早于常规止盈止损扫描）
             strategy.server_maybe_btc_yesterday_yang_flatten_at_new_utc_day()
+
+            # 启动时加载失败 → 重试加载交易所持仓
+            if not strategy.positions_loaded:
+                logging.warning("🔄 启动时未加载到交易所持仓，尝试重新加载...")
+                try:
+                    strategy.server_load_existing_positions()
+                    if strategy.positions_loaded:
+                        logging.info("✅ 成功重新加载交易所持仓")
+                    else:
+                        logging.warning("⚠️ 重新加载失败，将在下次监控循环重试")
+                except Exception as load_err:
+                    logging.error(f"❌ 重新加载持仓失败: {load_err}")
 
             # 监控持仓
             strategy.server_monitor_positions()
