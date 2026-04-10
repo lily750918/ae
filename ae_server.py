@@ -354,7 +354,9 @@ def generate_daily_report() -> str:
             report_lines.append("-" * 30)
             try:
                 if strategy and strategy.positions:
-                    for pos in strategy.positions:
+                    with strategy._positions_sync_lock:
+                        _report_positions_snapshot = strategy.positions[:]
+                    for pos in _report_positions_snapshot:
                         direction = "多头" if pos.get("direction") == "long" else "空头"
                         symbol = pos.get("symbol", "Unknown")
                         entry_time_str = pos.get("entry_time", "Unknown")
@@ -1819,7 +1821,8 @@ class AutoExchangeStrategy:
                         "loaded_from_exchange": True,  # 标记为从交易所加载
                     }
 
-                    self.positions.append(position)
+                    with self._positions_sync_lock:
+                        self.positions.append(position)
                     loaded_count += 1
 
                     direction_cn = "多头" if direction == "long" else "空头"
@@ -1928,30 +1931,30 @@ class AutoExchangeStrategy:
         🔧 v4 修复：使用全局写锁防止多线程并发损坏 JSON 文件
         """
         try:
-            record = {}
-            for position in self.positions:
-                symbol = position["symbol"]
-                record[symbol] = {
-                    "symbol": symbol,
-                    "direction": position.get("direction", "short"),
-                    "signal_datetime": position.get("signal_datetime"),
-                    "entry_time": position["entry_time"],
-                    "entry_price": position["entry_price"],
-                    "quantity": position["quantity"],
-                    "tp_pct": position.get("tp_pct", self.strong_coin_tp_pct),
-                    "tp_2h_checked": position.get("tp_2h_checked", False),
-                    "tp_12h_checked": position.get("tp_12h_checked", False),
-                    "dynamic_tp_strong": position.get("dynamic_tp_strong", False),
-                    "dynamic_tp_medium": position.get("dynamic_tp_medium", False),
-                    "dynamic_tp_weak": position.get("dynamic_tp_weak", False),
-                    "is_consecutive_confirmed": position.get(
-                        "is_consecutive_confirmed", False
-                    ),
-                    "tp_history": position.get("tp_history", []),
-                    "last_update": datetime.now(timezone.utc).isoformat(),
-                }
-
             with self._positions_sync_lock:
+                record = {}
+                for position in self.positions:
+                    symbol = position["symbol"]
+                    record[symbol] = {
+                        "symbol": symbol,
+                        "direction": position.get("direction", "short"),
+                        "signal_datetime": position.get("signal_datetime"),
+                        "entry_time": position["entry_time"],
+                        "entry_price": position["entry_price"],
+                        "quantity": position["quantity"],
+                        "tp_pct": position.get("tp_pct", self.strong_coin_tp_pct),
+                        "tp_2h_checked": position.get("tp_2h_checked", False),
+                        "tp_12h_checked": position.get("tp_12h_checked", False),
+                        "dynamic_tp_strong": position.get("dynamic_tp_strong", False),
+                        "dynamic_tp_medium": position.get("dynamic_tp_medium", False),
+                        "dynamic_tp_weak": position.get("dynamic_tp_weak", False),
+                        "is_consecutive_confirmed": position.get(
+                            "is_consecutive_confirmed", False
+                        ),
+                        "tp_history": position.get("tp_history", []),
+                        "last_update": datetime.now(timezone.utc).isoformat(),
+                    }
+
                 tmp_file = POSITIONS_RECORD_FILE + ".tmp"
                 with open(tmp_file, "w", encoding="utf-8") as f:
                     json.dump(record, f, indent=2, ensure_ascii=False)
@@ -2517,9 +2520,17 @@ class AutoExchangeStrategy:
             logging.error(f"❌ API扫描信号失败: {e}")
             return []
 
-    def server_check_position_limits(self) -> bool:
-        """检查持仓限制 - 服务器版本"""
+    def server_check_position_limits(self) -> Tuple[bool, set]:
+        """检查持仓限制 - 服务器版本
+
+        Returns:
+            (passed, exchange_symbols):
+                passed: True 表示通过限制检查，可以继续开仓
+                exchange_symbols: 交易所当前活跃持仓的 symbol 集合（用于去重）；
+                                  API 失败降级时返回内存中的 symbol 集合
+        """
         # 🔧 修复：从交易所API获取实际持仓数量，而不是仅检查内存中的记录
+        exchange_symbols: set = set()
         try:
             # 🔧 API调用重试机制
             actual_positions = None
@@ -2550,6 +2561,7 @@ class AutoExchangeStrategy:
                 p for p in actual_positions if float(p["positionAmt"]) != 0
             ]
             actual_count = len(active_positions)
+            exchange_symbols = {p["symbol"] for p in active_positions}
 
             logging.info(
                 f"📊 持仓检查: 内存记录={len(self.positions)}, 交易所实际={actual_count}, 上限={self.max_positions}"
@@ -2559,13 +2571,15 @@ class AutoExchangeStrategy:
                 logging.warning(
                     f"⚠️ 交易所实际持仓数 {actual_count} 已达到上限 {self.max_positions}"
                 )
-                return False
+                return False, exchange_symbols
         except Exception as e:
             logging.error(f"❌ 获取交易所持仓信息失败: {e}，使用内存记录")
-            # 如果API调用失败，降级使用内存中的记录
-            if len(self.positions) >= self.max_positions:
+            # 降级：用内存中的 symbol 集合
+            with self._positions_sync_lock:
+                exchange_symbols = {p["symbol"] for p in self.positions}
+            if len(exchange_symbols) >= self.max_positions:
                 logging.warning(f"⚠️ 已达到最大持仓数 {self.max_positions}")
-                return False
+                return False, exchange_symbols
 
         # 检查每日建仓数（重置计数器）
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -2578,7 +2592,7 @@ class AutoExchangeStrategy:
             logging.warning(
                 f"⚠️ 今日已达到最大建仓数 {self.daily_entries}/{self.max_daily_entries}"
             )
-            return False
+            return False, exchange_symbols
 
         # 🛡️ 方案 1：每日最大亏损检查
         if self.max_daily_loss_pct > 0:
@@ -2601,7 +2615,7 @@ class AutoExchangeStrategy:
                                 f"🛑 当日亏损 {daily_loss_pct:.1f}% 已达上限 {self.max_daily_loss_pct}%，"
                                 f"累计亏损 {today_pnl:.2f} USDT，停止开仓"
                             )
-                            return False
+                            return False, exchange_symbols
                         logging.info(
                             f"📊 当日亏损 {daily_loss_pct:.1f}% / 上限 {self.max_daily_loss_pct}%"
                         )
@@ -2620,7 +2634,7 @@ class AutoExchangeStrategy:
                 logging.warning(
                     f"🔒 连续亏损 {self.consecutive_losses} 笔，冷却中（剩余 {remaining:.1f}h），停止开仓"
                 )
-                return False
+                return False, exchange_symbols
             else:
                 # 冷却期已过，重置
                 self.consecutive_losses = 0
@@ -2636,9 +2650,9 @@ class AutoExchangeStrategy:
                 logging.warning(
                     f"⚠️ 本小时已建仓，请等待下一个小时 (当前: {current_hour.strftime('%H:00 UTC')})"
                 )
-                return False
+                return False, exchange_symbols
 
-        return True
+        return True, exchange_symbols
 
     def check_sufficient_funds(self, required_margin: float) -> bool:
         """检查是否有足够的可用资金（要求至少15%可用资金余量）"""
@@ -2792,7 +2806,9 @@ class AutoExchangeStrategy:
             logging.warning(f"🔒 {symbol} 正在建仓中，跳过重复请求")
             return False
 
+        entry_lock_acquired = False
         self._entry_global_lock.acquire()
+        entry_lock_acquired = True
         try:
             signal_price = signal["price"]  # 信号价格（用于记录）
 
@@ -2814,8 +2830,9 @@ class AutoExchangeStrategy:
                     )
                     return False
 
-            # 检查持仓限制
-            if not self.server_check_position_limits():
+            # 检查持仓限制（同时获取交易所当前持仓 symbol 集合）
+            limits_ok, exchange_symbols = self.server_check_position_limits()
+            if not limits_ok:
                 return False
 
             # BTC 昨日日K 阳线 → 当日不建新仓（与 hm1l 回测一致）
@@ -2825,11 +2842,19 @@ class AutoExchangeStrategy:
                     logging.warning(f"🚫 {symbol} 建仓被拒: {msg}")
                     return False
 
-            # 检查是否已持仓（增强版：防止重复建仓）
-            existing_positions = [p for p in self.positions if p["symbol"] == symbol]
+            # 🔧 v5 修复：以交易所为准检查是否已持仓（防止内存与交易所不一致时重复开仓）
+            if symbol in exchange_symbols:
+                logging.warning(
+                    f"⚠️ {symbol} 交易所已存在持仓，跳过建仓"
+                )
+                return False
+
+            # 内存侧也检查（双重保险，覆盖交易所 API 降级场景）
+            with self._positions_sync_lock:
+                existing_positions = [p for p in self.positions if p["symbol"] == symbol]
             if existing_positions:
                 logging.warning(
-                    f"⚠️ {symbol} 已存在 {len(existing_positions)} 个持仓，跳过建仓"
+                    f"⚠️ {symbol} 内存中已存在 {len(existing_positions)} 个持仓，跳过建仓"
                 )
                 for idx, pos in enumerate(existing_positions, 1):
                     pos_id = pos.get("position_id", "未知")[:8]
@@ -2968,8 +2993,10 @@ class AutoExchangeStrategy:
                 "sl_price": None,  # 止损价格
             }
 
-            self.positions.append(position)
-            self.daily_entries += 1
+            # 🔧 v5 修复 #8：持仓列表操作加锁
+            with self._positions_sync_lock:
+                self.positions.append(position)
+                self.daily_entries += 1
 
             # 记录建仓小时（用于每小时限制）
             current_hour = datetime.now(timezone.utc).replace(
@@ -2977,8 +3004,33 @@ class AutoExchangeStrategy:
             )
             self.last_entry_hour = current_hour
 
-            # 保存持仓记录到文件
-            self.server_save_positions_record()
+            # 🔧 v5 修复 #16：交易所仓位优先，本地持久化失败不影响仓位
+            # 保存持仓记录到文件（重试 2 次）
+            for _save_attempt in range(3):
+                try:
+                    self.server_save_positions_record()
+                    break
+                except Exception as save_err:
+                    logging.error(
+                        f"❌ {symbol} 保存持仓记录失败(尝试{_save_attempt + 1}/3): {save_err}"
+                    )
+                    if _save_attempt < 2:
+                        time.sleep(0.5)
+            else:
+                # 3 次都失败：仓位已在交易所 + 已在内存列表，文件落盘丢失
+                # 监控循环会从交易所重新对账，不影响止盈止损
+                logging.error(
+                    f"🚨 {symbol} 持仓记录持久化 3 次均失败！"
+                    f"内存持仓已添加，监控循环将正常管理止盈止损。"
+                    f"下次重启时将从交易所重新加载。"
+                )
+                send_email_alert(
+                    "持仓记录落盘失败",
+                    f"{symbol} 已在交易所成功开仓，内存中已记录，"
+                    f"但 positions_record.json 写入 3 次均失败。\n"
+                    f"止盈止损不受影响（下方继续创建）。\n"
+                    f"风险：进程重启前如文件仍未更新，将从交易所重新加载持仓。",
+                )
 
             logging.info(
                 f"🚀 开仓成功: {symbol} 价格:{price:.6f} 数量:{quantity:.3f} 杠杆:{self.leverage}x"
@@ -3040,7 +3092,7 @@ class AutoExchangeStrategy:
             logging.error(f"❌ {symbol} 开仓失败: {e}")
             return False
         finally:
-            if self._entry_global_lock.locked():
+            if entry_lock_acquired:
                 self._entry_global_lock.release()
             symbol_lock.release()
 
@@ -4300,12 +4352,14 @@ class AutoExchangeStrategy:
             logging.info("🔕 未配置 API：跳过止盈止损订单检查")
             return
         logging.info("🔍 🚀 服务器启动：按交易所开放单对账止盈/止损，缺失则补挂...")
-        logging.info(f"   📊 当前持仓数量: {len(self.positions)}")
+        with self._positions_sync_lock:
+            positions_snapshot = self.positions[:]
+        logging.info(f"   📊 当前持仓数量: {len(positions_snapshot)}")
 
         missing_count = 0
         recreated_count = 0
 
-        for position in self.positions:
+        for position in positions_snapshot:
             symbol = position["symbol"]
 
             try:
@@ -4687,8 +4741,9 @@ class AutoExchangeStrategy:
             current_time = datetime.now(timezone.utc)
             elapsed_hours = (current_time - entry_time).total_seconds() / 3600
 
-            # 从持仓列表移除
-            self.positions.remove(position)
+            # 从持仓列表移除（加锁保护）
+            with self._positions_sync_lock:
+                self.positions.remove(position)
 
             # 记录变动后状态
             after_state = {
@@ -4881,16 +4936,18 @@ class AutoExchangeStrategy:
 
     def server_monitor_positions(self):
         """监控持仓（集成动态止盈订单更新）- 服务器版本"""
-        if not self.positions:
-            return  # 没有持仓，直接返回
+        with self._positions_sync_lock:
+            if not self.positions:
+                return  # 没有持仓，直接返回
 
         # 与币安对齐：交易所已平仓则从本地移除（避免页面/逻辑残留）
         self.server_prune_flat_positions_from_exchange()
-        if not self.positions:
-            return
+        with self._positions_sync_lock:
+            if not self.positions:
+                return
 
-        # 🔒 并发控制：获取所有持仓的symbol锁
-        symbols_to_process = [pos["symbol"] for pos in self.positions]
+            # 🔒 并发控制：获取所有持仓的symbol锁
+            symbols_to_process = [pos["symbol"] for pos in self.positions]
         acquired_locks = []
 
         try:
@@ -4910,7 +4967,9 @@ class AutoExchangeStrategy:
             # 只处理成功获取锁的持仓
             locked_symbols = {symbol for symbol, _ in acquired_locks}
 
-            for position in self.positions[:]:  # 复制列表避免迭代时修改
+            with self._positions_sync_lock:
+                positions_snapshot = self.positions[:]
+            for position in positions_snapshot:  # 在锁外迭代快照
                 symbol = position["symbol"]
                 logging.debug(
                     f"🔍 检查锁状态 {symbol}: locked_symbols={list(locked_symbols)}"
@@ -5712,7 +5771,7 @@ def get_status():
             "success": True,
             "api_configured": getattr(strategy, "api_configured", True),
             "running": is_running,
-            "positions_count": len(strategy.positions),
+            "positions_count": len(strategy.positions),  # atomic len() on CPython — acceptable
             "today_entries": today_entries,
             "max_positions": strategy.max_positions,
             "max_daily_entries": strategy.max_daily_entries,
@@ -5818,10 +5877,12 @@ def get_positions():
             account_balance = 0
 
         result = []
+        with strategy._positions_sync_lock:
+            positions_snapshot = strategy.positions[:]
         logging.debug(
-            "get_positions: strategy.positions 长度=%d", len(strategy.positions)
+            "get_positions: strategy.positions 长度=%d", len(positions_snapshot)
         )
-        for pos in strategy.positions:
+        for pos in positions_snapshot:
             symbol = pos["symbol"]
             # 从交易所获取实时价格和盈亏
             binance_pos = next(
@@ -6338,8 +6399,9 @@ def api_close_position():
         data = request.json
         symbol = data["symbol"]
 
-        # 查找持仓
-        position = next((p for p in strategy.positions if p["symbol"] == symbol), None)
+        # 查找持仓（快照查找，避免迭代时被其他线程修改列表）
+        with strategy._positions_sync_lock:
+            position = next((p for p in strategy.positions if p["symbol"] == symbol), None)
 
         if not position:
             return jsonify({"error": f"{symbol} not found"}), 404
@@ -6406,10 +6468,11 @@ def update_tp_sl():
 
         # ✨ 优先通过position_id查找（精确匹配）
         if position_id:
-            position = next(
-                (p for p in strategy.positions if p.get("position_id") == position_id),
-                None,
-            )
+            with strategy._positions_sync_lock:
+                position = next(
+                    (p for p in strategy.positions if p.get("position_id") == position_id),
+                    None,
+                )
             if not position:
                 return jsonify(
                     {
@@ -6423,9 +6486,10 @@ def update_tp_sl():
             )
         elif symbol:
             # 兼容旧版本：通过symbol查找（如有多个持仓会有歧义）
-            matching_positions = [
-                p for p in strategy.positions if p["symbol"] == symbol
-            ]
+            with strategy._positions_sync_lock:
+                matching_positions = [
+                    p for p in strategy.positions if p["symbol"] == symbol
+                ]
             if not matching_positions:
                 return jsonify(
                     {
@@ -7799,28 +7863,20 @@ def save_signal_records(signals: list, scan_time: str, opened_symbols: set):
                 sym = s.get("symbol", "")
                 sig_t = s.get("signal_time", "")
                 opened_now = sym in opened_symbols
-                key = (sym, sig_t)
 
-                merged = False
-                for r in history:
-                    if (r.get("symbol", ""), r.get("signal_time", "")) == key:
-                        r["opened"] = bool(r.get("opened")) or opened_now
-                        merged = True
-                        break
-                if not merged:
-                    history.append(
-                        {
-                            "scan_time": scan_time,
-                            "signal_time": sig_t,
-                            "symbol": sym,
-                            "surge_ratio": round(float(s.get("surge_ratio", 0)), 4),
-                            "price": s.get("price", 0),
-                            "intraday_buy_ratio": round(
-                                float(s.get("intraday_buy_ratio", 0)), 4
-                            ),
-                            "opened": opened_now,
-                        }
-                    )
+                history.append(
+                    {
+                        "scan_time": scan_time,
+                        "signal_time": sig_t,
+                        "symbol": sym,
+                        "surge_ratio": round(float(s.get("surge_ratio", 0)), 4),
+                        "price": s.get("price", 0),
+                        "intraday_buy_ratio": round(
+                            float(s.get("intraday_buy_ratio", 0)), 4
+                        ),
+                        "opened": opened_now,
+                    }
+                )
 
             # 保留最近 90 天（按 scan_time）
             cutoff = (
