@@ -53,46 +53,14 @@ import uuid  # ✨ 用于生成持仓唯一ID
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# ==================== 配置日志 ====================
-log_dir = "logs"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(
-    log_dir, f"ae_server_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+# ==================== 日志配置（从 utils 导入） ====================
+from utils.logging_config import (
+    log_dir,
+    flush_logging_handlers,
+    _log_asctime_local,
+    _position_change_fmt_value,
 )
 
-_file_handler = RotatingFileHandler(
-    log_file,
-    maxBytes=20 * 1024 * 1024,
-    backupCount=14,
-    encoding="utf-8",
-)
-_file_handler.setFormatter(
-    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-)
-_console_handler = logging.StreamHandler()
-_console_handler.setFormatter(
-    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-)
-logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
-
-
-def flush_logging_handlers() -> None:
-    """将日志立即刷入文件与终端（含 Flask 工作线程内）。"""
-    for handler in logging.getLogger().handlers:
-        if hasattr(handler, "flush"):
-            handler.flush()
-
-
-def _log_asctime_local() -> str:
-    """与 logging.basicConfig 默认 asctime 一致：YYYY-MM-DD HH:MM:SS,mmm（本地时区）。"""
-    t = datetime.now()
-    return t.strftime("%Y-%m-%d %H:%M:%S") + f",{t.microsecond // 1000:03d}"
-
-
-def _position_change_fmt_value(value) -> str:
-    if isinstance(value, float):
-        return f"{value:.6f}"
-    return str(value)
 
 
 # python-binance 共用同一 Session；扫描/预热使用 ThreadPoolExecutor(max_workers=20)，
@@ -156,113 +124,19 @@ TRADE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "trade_history.json")
 SIGNAL_HISTORY_FILE = os.path.join(SCRIPT_DIR, "signal_history.json")
 _signal_history_lock = __import__("threading").Lock()
 
-# 币安 U 本位合约：算法单 orderType（与 futures_get_open_algo_orders 一致）
-FUTURES_ALGO_TP_TYPES = frozenset(
-    {
-        "TAKE_PROFIT_MARKET",
-        "TAKE_PROFIT",
-        "TAKE_PROFIT_LIMIT",
-    }
+# 算法单工具函数（从 utils 导入）
+from utils.orders import (
+    FUTURES_ALGO_TP_TYPES,
+    FUTURES_ALGO_SL_TYPES,
+    futures_algo_trigger_price,
+    position_close_side,
+    pick_tp_sl_algo_candidates,
+    algo_order_id_from_dict,
+    cancel_order_algo_or_regular,
 )
-FUTURES_ALGO_SL_TYPES = frozenset(
-    {
-        "STOP_MARKET",
-        "STOP",
-        "STOP_LIMIT",
-    }
-)
-
-
-def futures_algo_trigger_price(order: dict):
-    """读取算法单触发价（新接口多为 triggerPrice，部分字段为 stopPrice）。"""
-    for key in ("triggerPrice", "stopPrice", "activatePrice"):
-        v = order.get(key)
-        if v is None or v == "":
-            continue
-        try:
-            f = float(v)
-            if f > 0:
-                return f
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def position_close_side(is_long: bool) -> str:
-    """单向持仓下平仓方向：多仓用 SELL，空仓用 BUY。"""
-    return "SELL" if is_long else "BUY"
-
-
-def pick_tp_sl_algo_candidates(
-    algo_orders: List[dict],
-    close_side: str,
-    preferred_tp_id: Optional[str] = None,
-    preferred_sl_id: Optional[str] = None,
-) -> Tuple[Optional[dict], Optional[dict]]:
-    """在开放算法单中选与本仓平仓方向一致的止盈、止损单（各一张；多单位时优先匹配本地记录的 algoId）。"""
-    tps = [
-        o
-        for o in algo_orders
-        if o.get("orderType") in FUTURES_ALGO_TP_TYPES and o.get("side") == close_side
-    ]
-    sls = [
-        o
-        for o in algo_orders
-        if o.get("orderType") in FUTURES_ALGO_SL_TYPES and o.get("side") == close_side
-    ]
-
-    def _pick(cands: List[dict], pref: Optional[str]) -> Optional[dict]:
-        if not cands:
-            return None
-        if pref:
-            ps = str(pref).strip()
-            for o in cands:
-                oid = str(o.get("algoId") or o.get("orderId") or "")
-                if oid == ps:
-                    return o
-        return cands[0]
-
-    return _pick(tps, preferred_tp_id), _pick(sls, preferred_sl_id)
-
-
-def algo_order_id_from_dict(order: Optional[dict]) -> Optional[str]:
-    if not order:
-        return None
-    s = str(order.get("algoId") or order.get("orderId") or "").strip()
-    return s or None
-
-
-def cancel_order_algo_or_regular(client, symbol: str, order_id_str: str) -> bool:
-    """先按算法单 algoId 取消，再尝试普通 orderId。"""
-    if not order_id_str:
-        return False
-    oid = str(order_id_str).strip()
-    try:
-        client.futures_cancel_algo_order(symbol=symbol, algoId=int(oid))
-        return True
-    except BinanceAPIException as e:
-        logging.debug(f"取消算法单失败 {symbol} algoId={oid}: {e}")
-    except (OSError, TimeoutError) as e:
-        logging.warning(f"网络错误取消算法单 {symbol}: {e}")
-    except Exception as e:
-        logging.debug(f"取消算法单失败 {symbol}: {e}")
-    try:
-        client.futures_cancel_order(symbol=symbol, orderId=int(oid))
-        return True
-    except BinanceAPIException as e:
-        logging.debug(f"取消普通单失败 {symbol} orderId={oid}: {e}")
-        return False
-    except (OSError, TimeoutError) as e:
-        logging.warning(f"网络错误取消普通单 {symbol}: {e}")
-        return False
-    except Exception as e:
-        logging.error(f"取消订单失败 {symbol}: {e}")
-        return False
 
 
 # ==================== 邮件报警配置 ====================
-ALERT_EMAIL = "13910306825@163.com"  # 报警接收邮箱
-
 
 def _fetch_futures_realized_pnl_window(
     client: Client, start_ms: int, end_ms: int
@@ -643,172 +517,12 @@ def send_daily_report() -> bool:
         return False
 
 
-def send_email_alert(subject: str, message: str):
-    """发送邮件报警"""
-    try:
-        # 使用163邮箱SMTP服务（免费，需要授权码）
-        # 注意：需要在环境变量中配置邮箱和授权码
-        sender_email = os.getenv("SMTP_EMAIL")  # 发件邮箱
-        sender_password = os.getenv("SMTP_PASSWORD")  # 授权码（不是邮箱密码）
-
-        if not sender_email or not sender_password:
-            logging.warning("⚠️ 未配置邮件发送账号，跳过邮件报警")
-            return
-
-        # 创建邮件
-        msg = MIMEMultipart()
-        msg["From"] = sender_email
-        msg["To"] = ALERT_EMAIL
-        msg["Subject"] = f"[AE交易系统] {subject}"
-
-        # 邮件正文
-        body = f"""
-AE自动交易系统报警
-
-时间: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}
-
-{message}
-
----
-此邮件由AE交易系统自动发送
-服务器: {os.uname().nodename if hasattr(os, "uname") else "Unknown"}
-"""
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-
-        # 发送邮件
-        with smtplib.SMTP_SSL("smtp.163.com", 465, timeout=10) as server:
-            server.login(sender_email, sender_password)
-            server.send_message(msg)
-
-        logging.info(f"✅ 邮件报警已发送: {subject}")
-
-    except Exception as e:
-        logging.error(f"❌ 发送邮件报警失败: {e}")
+# 邮件报警（从 utils 导入）
+from utils.email import ALERT_EMAIL, send_email_alert
 
 
-class YesterdayDataCache:
-    """昨日数据缓存类（避免重复API调用）"""
-
-    def __init__(self, client):
-        self.client = client
-        self.cache = {}
-        self.cache_date = None
-        logging.info("📦 初始化昨日数据缓存")
-
-    def get_yesterday_avg_sell_api(self, symbol: str) -> Optional[float]:
-        """获取昨日平均小时卖量（带缓存）- API版本"""
-        try:
-            if self.client is None:
-                return None
-            # 检查缓存是否过期
-            today = datetime.now(timezone.utc).date()
-            if self.cache_date != today:
-                if self.cache_date:
-                    logging.info(
-                        f"🔄 清空昨日缓存（日期变更: {self.cache_date} -> {today}）"
-                    )
-                self.cache = {}
-                self.cache_date = today
-
-            # 从缓存读取
-            if symbol in self.cache:
-                return self.cache[symbol]
-
-            # 从API获取昨日日K线
-            yesterday = today - timedelta(days=1)
-            yesterday_start = int(
-                datetime.combine(yesterday, datetime.min.time())
-                .replace(tzinfo=timezone.utc)
-                .timestamp()
-                * 1000
-            )
-            yesterday_end = int(
-                datetime.combine(yesterday, datetime.max.time())
-                .replace(tzinfo=timezone.utc)
-                .timestamp()
-                * 1000
-            )
-
-            klines = self.client.futures_klines(
-                symbol=symbol,
-                interval="1d",
-                startTime=yesterday_start,
-                endTime=yesterday_end,
-                limit=1,
-            )
-
-            if not klines:
-                return None
-
-            # 计算昨日平均小时卖量
-            volume = float(klines[0][5])  # 总成交量
-            active_buy_volume = float(klines[0][9])  # 主动买入量
-            total_sell = volume - active_buy_volume
-            avg_hour_sell = total_sell / 24.0
-
-            # 缓存结果
-            self.cache[symbol] = avg_hour_sell
-
-            return avg_hour_sell
-
-        except Exception as e:
-            logging.error(f"❌ 获取 {symbol} 昨日数据失败: {e}")
-            return None
-
-    def prefetch_all(self, symbols: list):
-        """扫描前并发预热所有 symbol 的昨日数据，避免扫描主循环中逐个发 API 请求"""
-        missing = [s for s in symbols if s not in self.cache]
-        if not missing:
-            return
-        logging.info(f"📦 开始并发预热昨日缓存，共 {len(missing)} 个交易对...")
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {
-                executor.submit(self.get_yesterday_avg_sell_api, s): s for s in missing
-            }
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except BinanceAPIException as e:
-                    logging.warning(f"预热缓存失败: {e}")
-                except Exception as e:
-                    logging.debug(f"预热缓存异常: {e}")
-        logging.info(f"📦 昨日缓存预热完成")
-
-
-# 备用交易对列表（API获取失败时使用）
-BACKUP_SYMBOL_LIST = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "ADAUSDT",
-    "DOGEUSDT",
-    "MATICUSDT",
-    "DOTUSDT",
-    "AVAXUSDT",
-    "SHIBUSDT",
-    "LTCUSDT",
-    "LINKUSDT",
-    "ATOMUSDT",
-    "UNIUSDT",
-    "ETCUSDT",
-    "XLMUSDT",
-    "NEARUSDT",
-    "ALGOUSDT",
-    "ICPUSDT",
-    "APTUSDT",
-    "FILUSDT",
-    "LDOUSDT",
-    "ARBUSDT",
-    "OPUSDT",
-    "SUIUSDT",
-    "INJUSDT",
-    "TIAUSDT",
-    "ORDIUSDT",
-    "RUNEUSDT",
-]
-
+# 昨日数据缓存 + 备用交易对列表（从 utils 导入）
+from utils.cache import YesterdayDataCache, BACKUP_SYMBOL_LIST
 
 def load_config():
     """从配置文件加载配置；若无文件则使用空段（仅界面模式 + 代码内 fallback 参数）。"""
