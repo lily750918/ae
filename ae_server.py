@@ -186,12 +186,14 @@ def verify_password(username, password):
 def _security_headers(resp):
     """为所有响应添加安全头"""
     resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # 获取允许的跨域源，如果没有配置则允许 self
+    connect_src = " ".join(["'self'"] + _ALLOWED_ORIGINS)
     resp.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-        "connect-src 'self'; frame-ancestors 'none'"
+        f"default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        f"style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        f"connect-src {connect_src}; frame-ancestors 'self'"
     )
     return resp
 
