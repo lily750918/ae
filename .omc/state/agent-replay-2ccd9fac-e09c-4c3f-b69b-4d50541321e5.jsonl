@@ -1,0 +1,2 @@
+{"t":0,"agent":"a65d9a1","agent_type":"security-reviewer","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"a65d9a1","agent_type":"security-reviewer","event":"agent_stop","success":true,"duration_ms":305920}

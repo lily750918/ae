@@ -1,0 +1,280 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1775825050312,
+  "projectRoot": "/Users/tony/Documents/ae",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml",
+          "requirements.txt"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "flask",
+        "version": null,
+        "category": "backend"
+      }
+    ],
+    "packageManager": "pip",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "static",
+      "tests"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 12,
+      "lastAccessed": 1775825050271,
+      "keyFiles": [
+        "ae_server.cpython-312.pyc",
+        "ae_server.cpython-313.pyc",
+        "ae_server.cpython-314.pyc",
+        "binance.cpython-313.pyc",
+        "binance_api.cpython-312.pyc"
+      ]
+    },
+    "data": {
+      "path": "data",
+      "purpose": "Data files",
+      "fileCount": 3,
+      "lastAccessed": 1775825050280,
+      "keyFiles": [
+        "positions_record.json",
+        "signal_history.json",
+        "trade_history.json"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 3,
+      "lastAccessed": 1775825050282,
+      "keyFiles": [
+        "open_position_flow.md",
+        "refactor_plan.md",
+        "signal_generation.md"
+      ]
+    },
+    "logs": {
+      "path": "logs",
+      "purpose": null,
+      "fileCount": 17,
+      "lastAccessed": 1775825050298,
+      "keyFiles": [
+        "ae_server_20260410_181117.log",
+        "ae_server_20260410_181141.log",
+        "ae_server_20260410_181819.log",
+        "ae_server_20260410_182825.log",
+        "ae_server_20260410_185107.log"
+      ]
+    },
+    "static": {
+      "path": "static",
+      "purpose": "Static files",
+      "fileCount": 0,
+      "lastAccessed": 1775825050298,
+      "keyFiles": []
+    },
+    "strategy": {
+      "path": "strategy",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1775825050299,
+      "keyFiles": [
+        "__init__.py",
+        "core.py",
+        "entry.py",
+        "exit.py",
+        "monitor.py"
+      ]
+    },
+    "templates": {
+      "path": "templates",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1775825050300,
+      "keyFiles": [
+        "_nav.html",
+        "monitor.html",
+        "params.html"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 3,
+      "lastAccessed": 1775825050300,
+      "keyFiles": [
+        "conftest.py",
+        "test_api_health_and_auth.py",
+        "test_config_apply.py"
+      ]
+    },
+    "utils": {
+      "path": "utils",
+      "purpose": "Utility functions",
+      "fileCount": 6,
+      "lastAccessed": 1775825050301,
+      "keyFiles": [
+        "__init__.py",
+        "cache.py",
+        "daily_report.py",
+        "email.py",
+        "logging_config.py"
+      ]
+    },
+    "web": {
+      "path": "web",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775825050301,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "ae_server.py",
+      "accessCount": 28,
+      "lastAccessed": 1775829103322,
+      "type": "file"
+    },
+    {
+      "path": "static/js/app.js",
+      "accessCount": 15,
+      "lastAccessed": 1775827760784,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 10,
+      "lastAccessed": 1775825423359,
+      "type": "directory"
+    },
+    {
+      "path": "config.py",
+      "accessCount": 8,
+      "lastAccessed": 1775829431143,
+      "type": "file"
+    },
+    {
+      "path": "strategy/core.py",
+      "accessCount": 6,
+      "lastAccessed": 1775825673246,
+      "type": "file"
+    },
+    {
+      "path": "strategy/tp_sl.py",
+      "accessCount": 6,
+      "lastAccessed": 1775825673723,
+      "type": "file"
+    },
+    {
+      "path": "templates/monitor.html",
+      "accessCount": 6,
+      "lastAccessed": 1775827976772,
+      "type": "directory"
+    },
+    {
+      "path": "hermes_conversation_20260410_204333.json",
+      "accessCount": 4,
+      "lastAccessed": 1775825206989,
+      "type": "directory"
+    },
+    {
+      "path": "utils/email.py",
+      "accessCount": 4,
+      "lastAccessed": 1775825643605,
+      "type": "file"
+    },
+    {
+      "path": "templates/params.html",
+      "accessCount": 3,
+      "lastAccessed": 1775827978296,
+      "type": "directory"
+    },
+    {
+      "path": "ecosystem.config.cjs",
+      "accessCount": 2,
+      "lastAccessed": 1775826083753,
+      "type": "file"
+    },
+    {
+      "path": "templates",
+      "accessCount": 2,
+      "lastAccessed": 1775827851050,
+      "type": "directory"
+    },
+    {
+      "path": "static",
+      "accessCount": 2,
+      "lastAccessed": 1775827851563,
+      "type": "directory"
+    },
+    {
+      "path": "strategy/positions.py",
+      "accessCount": 1,
+      "lastAccessed": 1775825133772,
+      "type": "file"
+    },
+    {
+      "path": "utils/daily_report.py",
+      "accessCount": 1,
+      "lastAccessed": 1775825141263,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_api_health_and_auth.py",
+      "accessCount": 1,
+      "lastAccessed": 1775825142089,
+      "type": "file"
+    },
+    {
+      "path": ".env.example",
+      "accessCount": 1,
+      "lastAccessed": 1775826114468,
+      "type": "file"
+    },
+    {
+      "path": "static/css/style.css",
+      "accessCount": 1,
+      "lastAccessed": 1775827048785,
+      "type": "directory"
+    },
+    {
+      "path": "templates/_nav.html",
+      "accessCount": 1,
+      "lastAccessed": 1775827859373,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

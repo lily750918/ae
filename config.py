@@ -31,6 +31,15 @@ from utils.logging_config import log_dir
 _BINANCE_HTTP_POOL_MAX = 32
 
 
+def _get_proxies() -> Optional[dict]:
+    """从环境变量读取代理配置（HTTPS_PROXY 优先，其次 HTTP_PROXY）。"""
+    https = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    http = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    if https or http:
+        return {"https": https or http, "http": http or https}
+    return None
+
+
 def _configure_binance_http_adapter(session: Optional[requests.Session]) -> None:
     if session is None:
         return
@@ -40,6 +49,9 @@ def _configure_binance_http_adapter(session: Optional[requests.Session]) -> None
     )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    proxies = _get_proxies()
+    if proxies:
+        session.proxies.update(proxies)
 
 
 # ---------------------------------------------------------------------------
@@ -372,13 +384,20 @@ def _key_tail_4(k: Optional[str]) -> str:
 
 def _create_binance_client(api_key: str, api_secret: str) -> Client:
     """创建 U 本位期货 Client（与 AutoExchangeStrategy.__init__ 逻辑一致，含现货 ping 绕过）。"""
+    proxies = _get_proxies()
+    req_params = {"proxies": proxies} if proxies else {}
+    if proxies:
+        logging.info("🌐 Binance Client 使用代理: %s", proxies.get("https") or proxies.get("http"))
+
     last_error: Optional[Exception] = None
     for attempt in range(3):
         try:
             try:
-                c = Client(api_key, api_secret, tld="com", testnet=False, ping=False)
+                c = Client(api_key, api_secret, tld="com", testnet=False, ping=False,
+                           requests_params=req_params)
             except TypeError:
-                c = Client(api_key, api_secret, tld="com", testnet=False)
+                c = Client(api_key, api_secret, tld="com", testnet=False,
+                           requests_params=req_params)
             c.FUTURES_RECV_WINDOW = 10000
             return c
         except Exception as e:
@@ -399,6 +418,7 @@ def _create_binance_client(api_key: str, api_secret: str) -> Client:
                             tld="com",
                             testnet=False,
                             ping=False,
+                            requests_params=req_params,
                         )
                     except TypeError:
                         Client.__init__(
@@ -407,6 +427,7 @@ def _create_binance_client(api_key: str, api_secret: str) -> Client:
                             api_secret,
                             tld="com",
                             testnet=False,
+                            requests_params=req_params,
                         )
                     raw.FUTURES_RECV_WINDOW = 10000
                     return raw
@@ -450,8 +471,9 @@ def _sync_strategy_config_binance_from_parser(
 
 def _reinit_strategy_binance_client_after_ini_change() -> Tuple[bool, str]:
     """写入 config.ini 后按「环境变量优先」规则重建 strategy 的 client。返回 (ok, message)。"""
-    # NOTE: 'strategy' global will be imported from state.py in a later refactor step
-    global strategy
+    # 延迟导入 ae_server 获取全局 strategy（避免循环导入）
+    import ae_server
+    strategy = ae_server.strategy
     if strategy is None:
         return True, "strategy 未初始化，下次启动将读取新密钥"
     cfg = load_config()

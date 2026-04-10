@@ -357,6 +357,96 @@
     // autoSize: true 已自动处理容器尺寸变化，无需手动 ResizeObserver
   }
 
+  // ── BTC 主图（服务端 Binance K 线，无 TradingView 外网依赖）──────────────
+  let _btcChart = null;
+  let _btcCandles = null;
+  let _btcVol = null;
+  let _btcInterval = '1d';
+  let _btcRefreshTimer = null;
+
+  function initBtcChart(interval) {
+    const wrap = document.getElementById('btc-main-chart');
+    if (!wrap) return;
+    if (typeof LightweightCharts === 'undefined') {
+      wrap.innerHTML = '<div class="empty-state">图表库加载中…</div>';
+      setTimeout(() => initBtcChart(interval), 1000);
+      return;
+    }
+
+    _btcInterval = interval || _btcInterval;
+
+    if (_btcChart) { _btcChart.remove(); _btcChart = null; _btcCandles = null; _btcVol = null; }
+    clearInterval(_btcRefreshTimer);
+
+    wrap.innerHTML = `
+      <div class="lwc-toolbar">
+        <div class="lwc-interval-btns">
+          <button class="lwc-btn${_btcInterval==='1h'?' lwc-btn-active':''}" data-btc-iv="1h">1H</button>
+          <button class="lwc-btn${_btcInterval==='4h'?' lwc-btn-active':''}" data-btc-iv="4h">4H</button>
+          <button class="lwc-btn${_btcInterval==='1d'?' lwc-btn-active':''}" data-btc-iv="1d">1D</button>
+        </div>
+        <span class="lwc-tag lwc-tag-entry" style="font-size:11px;opacity:.6">BTCUSDT · Binance</span>
+      </div>
+      <div class="lwc-inner"></div>`;
+
+    wrap.querySelectorAll('.lwc-btn[data-btc-iv]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const iv = btn.getAttribute('data-btc-iv');
+        if (iv !== _btcInterval) initBtcChart(iv);
+      });
+    });
+
+    const inner = wrap.querySelector('.lwc-inner');
+    _btcChart = LightweightCharts.createChart(inner, {
+      autoSize: true,
+      layout: { background: { type: 'solid', color: '#121824' }, textColor: '#8a9bb0' },
+      grid: {
+        vertLines: { color: 'rgba(94,123,168,0.08)' },
+        horzLines: { color: 'rgba(94,123,168,0.08)' },
+      },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      rightPriceScale: { borderColor: 'rgba(94,123,168,0.22)' },
+      timeScale: { borderColor: 'rgba(94,123,168,0.22)', timeVisible: _btcInterval !== '1d', secondsVisible: false },
+    });
+
+    _btcCandles = _btcChart.addCandlestickSeries({
+      upColor: '#34d399', downColor: '#f87171',
+      borderVisible: false,
+      wickUpColor: '#34d399', wickDownColor: '#f87171',
+      priceFormat: { type: 'custom', formatter: fmtChartPrice },
+    });
+
+    _btcVol = _btcChart.addHistogramSeries({
+      priceFormat: { type: 'volume' },
+      priceScaleId: 'vol',
+    });
+    _btcChart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+    refreshBtcChart();
+    // 每 5 分钟自动刷新最新 K 线
+    _btcRefreshTimer = setInterval(refreshBtcChart, 5 * 60 * 1000);
+  }
+
+  // 每个周期默认可见 bar 数（决定初始缩放）
+  const _btcVisibleBars = { '1h': 48, '4h': 60, '1d': 90 };
+
+  async function refreshBtcChart() {
+    if (!_btcChart || !_btcCandles) return;
+    const limit = _btcInterval === '1d' ? 365 : 200;
+    const { data } = await api('/api/klines?symbol=BTCUSDT&interval=' + _btcInterval + '&limit=' + limit);
+    if (!data || !data.success || !_btcCandles) return;
+    _btcCandles.setData(data.data);
+    _btcVol.setData(data.data.map((d) => ({
+      time: d.time,
+      value: d.volume,
+      color: d.close >= d.open ? 'rgba(52,211,153,0.35)' : 'rgba(248,113,113,0.35)',
+    })));
+    // 只显示最近 N 根，其余可左滑查看
+    const total = data.data.length;
+    const visible = _btcVisibleBars[_btcInterval] || 60;
+    _btcChart.timeScale().setVisibleLogicalRange({ from: total - visible, to: total + 2 });
+  }
+
   function highlightActiveRow() {
     document.querySelectorAll('.position-row').forEach((row) => {
       row.classList.toggle(
@@ -953,6 +1043,7 @@
     refreshData();
     loadStrategyParams();
     startPositionsStream();
+    initBtcChart();
     // 状态栏约每 10 秒刷新；持仓列表由 SSE 在结构变化时刷新，此处仅定时补拉盈亏/价格（约 45 秒）
     setInterval(async () => {
       const anyModalOpen = document.querySelector('.modal.open, .modal.is-open');

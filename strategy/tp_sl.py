@@ -1,6 +1,7 @@
 """Take-profit / stop-loss mixin for AutoExchangeStrategy."""
 
 import os
+import subprocess
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -81,7 +82,10 @@ class TpSlMixin:
         """播放报警声音 - 服务器版本"""
         try:
             # macOS系统声音
-            os.system("afplay /System/Library/Sounds/Basso.aiff")
+            subprocess.run(
+                ["/usr/bin/afplay", "/System/Library/Sounds/Basso.aiff"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
         except OSError as e:
             logging.warning(f"播放报警声音失败: {e}")
 

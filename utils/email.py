@@ -10,7 +10,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # ==================== 邮件报警配置 ====================
-ALERT_EMAIL = "13910306825@163.com"  # 报警接收邮箱
+ALERT_EMAIL = os.environ.get("AE_ALERT_EMAIL", "")  # 报警接收邮箱（通过环境变量配置）
 
 
 def send_email_alert(subject: str, message: str):
@@ -22,7 +22,10 @@ def send_email_alert(subject: str, message: str):
         sender_password = os.getenv("SMTP_PASSWORD")  # 授权码（不是邮箱密码）
 
         if not sender_email or not sender_password:
-            logging.warning("⚠️ 未配置邮件发送账号，跳过邮件报警")
+            logging.warning("⚠️ 未配置邮件发送账号（SMTP_EMAIL/SMTP_PASSWORD），跳过邮件报警")
+            return
+        if not ALERT_EMAIL:
+            logging.warning("⚠️ 未配置报警接收邮箱（AE_ALERT_EMAIL），跳过邮件报警")
             return
 
         # 创建邮件

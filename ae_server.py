@@ -13,6 +13,29 @@ AE Server - Auto Exchange 自动交易软件（服务器版本）
 创建时间：2026-02-12
 """
 
+import os as _os, pathlib as _pl
+
+def _load_dotenv(path: str = ".env") -> None:
+    """从 .env 文件加载环境变量（不覆盖已有的系统变量）。"""
+    p = _pl.Path(path)
+    if not p.exists():
+        p = _pl.Path(__file__).parent / path
+    if not p.exists():
+        return
+    with p.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip()
+            # 移除行尾注释并去除两端空格
+            v = v.split("#")[0].strip().strip('"').strip("'")
+            if k and k not in _os.environ:
+                _os.environ[k] = v
+
+_load_dotenv()
+
 from flask import (
     Flask,
     jsonify,
@@ -53,12 +76,22 @@ import uuid  # ✨ 用于生成持仓唯一ID
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# ==================== 日志配置（从 utils 导入） ====================
+# ==================== 工具模块导入 ====================
 from utils.logging_config import (
     log_dir,
     flush_logging_handlers,
     _log_asctime_local,
     _position_change_fmt_value,
+)
+from utils.email import ALERT_EMAIL, send_email_alert
+from utils.orders import (
+    FUTURES_ALGO_TP_TYPES,
+    FUTURES_ALGO_SL_TYPES,
+    futures_algo_trigger_price,
+    position_close_side,
+    pick_tp_sl_algo_candidates,
+    algo_order_id_from_dict,
+    cancel_order_algo_or_regular,
 )
 
 
@@ -113,16 +146,32 @@ from strategy import AutoExchangeStrategy
 
 # ==================== Flask Web服务 ====================
 app = Flask(__name__)
-CORS(app)  # 允许跨域
+# 仅允许显式配置的来源跨域访问；未配置则拒绝所有跨域请求
+_ALLOWED_ORIGINS: list[str] = [
+    o.strip()
+    for o in os.environ.get("AE_ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+]
+CORS(
+    app,
+    resources={r"/api/*": {"origins": _ALLOWED_ORIGINS}},
+    supports_credentials=False,
+    max_age=600,
+)
 # 前端约每 10s 轮询 /api，默认会在终端刷屏打印 GET … 200
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 auth = HTTPBasicAuth()
 
-# 🔐 用户认证配置
-# 用户名和密码（可以从环境变量或配置文件读取）
-users = {
-    "admin": generate_password_hash("admin123")  # 固定密码admin123
-}
+# 🔐 用户认证配置（必须通过环境变量 AE_ADMIN_PASSWORD 设置，长度 ≥ 16 位）
+_AE_ADMIN_USER = os.environ.get("AE_ADMIN_USER", "admin")
+_AE_ADMIN_PASSWORD = os.environ.get("AE_ADMIN_PASSWORD", "")
+if not _AE_ADMIN_PASSWORD or len(_AE_ADMIN_PASSWORD) < 16:
+    raise SystemExit(
+        "❌ 安全启动失败：必须设置环境变量 AE_ADMIN_PASSWORD（长度 ≥ 16 位）。\n"
+        "   生成示例: python -c \"import secrets; print(secrets.token_urlsafe(24))\"\n"
+        "   然后在启动前执行: export AE_ADMIN_PASSWORD=<生成的密码>"
+    )
+users = {_AE_ADMIN_USER: generate_password_hash(_AE_ADMIN_PASSWORD)}
 
 
 @auth.verify_password
@@ -131,6 +180,20 @@ def verify_password(username, password):
     if username in users and check_password_hash(users.get(username), password):
         return username
     return None
+
+
+@app.after_request
+def _security_headers(resp):
+    """为所有响应添加安全头"""
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; frame-ancestors 'none'"
+    )
+    return resp
 
 
 # 全局变量
@@ -181,12 +244,19 @@ _SENSITIVE_API_RATE_LIMITS: Dict[str, Tuple[int, float]] = {
 }
 
 
+_TRUSTED_PROXIES: frozenset[str] = frozenset(
+    o.strip() for o in os.environ.get("AE_TRUSTED_PROXIES", "").split(",") if o.strip()
+)
+
+
 def _request_client_ip() -> str:
-    xff = request.headers.get("X-Forwarded-For", "") or request.headers.get(
-        "X-Real-IP", ""
-    )
-    if xff:
-        return xff.split(",")[0].strip()[:64]
+    # 仅当请求来自已知可信代理时才信任 X-Forwarded-For，防止伪造 IP 绕过限流
+    if request.remote_addr in _TRUSTED_PROXIES:
+        xff = request.headers.get("X-Forwarded-For", "") or request.headers.get(
+            "X-Real-IP", ""
+        )
+        if xff:
+            return xff.split(",")[0].strip()[:64]
     return (request.remote_addr or "unknown")[:64]
 
 
@@ -203,6 +273,20 @@ def _rate_limit_allow(bucket_key: str, max_calls: int, period_sec: float) -> boo
             return False
         lst.append(now)
         return True
+
+
+@app.before_request
+def _csrf_origin_guard():
+    """拒绝来源不在白名单的跨域 POST/PUT/DELETE 请求（防 CSRF）。"""
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    if not request.path.startswith("/api"):
+        return None
+    origin = request.headers.get("Origin", "")
+    if origin and _ALLOWED_ORIGINS and origin not in _ALLOWED_ORIGINS:
+        logging.warning("⚠️ CSRF 拦截: origin=%s path=%s", origin, request.path)
+        return jsonify({"success": False, "error": "跨域请求被拒绝"}), 403
+    return None
 
 
 @app.before_request
@@ -1074,16 +1158,20 @@ def search_logs():
     """搜索所有日志文件中的关键字"""
     try:
         keyword = request.args.get("keyword", "")
-        date = request.args.get("date", "")  # 可选：只搜索特定日期，格式：YYYYMMDD
+        date = request.args.get("date", "")
         max_results = request.args.get("max", 100, type=int)
-        max_results = min(max_results, 500)  # 最多500条
+        max_results = min(max(max_results, 1), 500)
 
         if not keyword:
             return jsonify({"error": "keyword参数必须提供"}), 400
+        if len(keyword) > 200:
+            return jsonify({"error": "keyword 长度不能超过200位"}), 400
+
+        if date and not re.fullmatch(r"\d{8}", date):
+            return jsonify({"error": "date 格式错误，须为 YYYYMMDD"}), 400
 
         # 获取日志文件
         if date:
-            # 只搜索指定日期的日志
             log_pattern = os.path.join(log_dir, f"ae_server_{date}_*.log")
         else:
             # 搜索所有日志
@@ -1144,8 +1232,10 @@ def api_close_position():
         if strategy is None:
             return jsonify({"error": "Strategy not initialized"}), 500
 
-        data = request.json
-        symbol = data["symbol"]
+        data = request.get_json(silent=True) or {}
+        symbol = (data.get("symbol") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,20}", symbol):
+            return jsonify({"error": "无效的 symbol 参数"}), 400
 
         # 查找持仓（快照查找，避免迭代时被其他线程修改列表）
         with strategy._positions_sync_lock:
@@ -1204,15 +1294,15 @@ def update_tp_sl():
                 }
             ), 500
 
-        data = request.json
-        logging.info(f"📋 收到修改止盈止损请求: {data}")  # 🔧 调试日志
-        symbol = data.get("symbol")
-        position_id = data.get("position_id")  # ✨ 新增：支持通过position_id精确定位
-        tp_price = data.get("tp_price")  # 止盈价格
-        sl_price = data.get("sl_price")  # 止损价格
+        data = request.get_json(silent=True) or {}
+        symbol = (data.get("symbol") or "").strip().upper() or None
+        position_id = data.get("position_id")
+        tp_price = data.get("tp_price")
+        sl_price = data.get("sl_price")
         logging.info(
-            f"🔍 解析参数: symbol={symbol}, position_id={position_id}, tp_price={tp_price}, sl_price={sl_price}"
-        )  # 🔧 调试日志
+            "📋 修改止盈止损: symbol=%s position_id=%.8s tp=%s sl=%s",
+            symbol, position_id or "", tp_price, sl_price,
+        )
 
         # ✨ 优先通过position_id查找（精确匹配）
         if position_id:
@@ -1904,9 +1994,13 @@ def cancel_order():
         if strategy is None:
             return jsonify({"error": "Strategy not initialized"}), 500
 
-        data = request.json
-        symbol = data["symbol"]
-        order_id = data["order_id"]
+        data = request.get_json(silent=True) or {}
+        symbol = (data.get("symbol") or "").strip().upper()
+        order_id = data.get("order_id")
+        if not re.fullmatch(r"[A-Z0-9]{2,20}", symbol):
+            return jsonify({"error": "无效的 symbol 参数"}), 400
+        if not order_id:
+            return jsonify({"error": "order_id 不能为空"}), 400
 
         if not cancel_order_algo_or_regular(strategy.client, symbol, str(order_id)):
             return jsonify({"error": "取消订单失败（算法单与普通单均尝试失败）"}), 400
@@ -1926,8 +2020,8 @@ def get_position_logs():
     """获取仓位变动日志（分页显示）"""
     try:
         # 获取查询参数
-        page = int(request.args.get("page", 1))
-        per_page = int(request.args.get("per_page", 50))
+        page = max(request.args.get("page", 1, type=int), 1)
+        per_page = min(max(request.args.get("per_page", 50, type=int), 1), 500)
 
         # 读取仓位变动日志文件
         position_log_file = os.path.join(log_dir, "position_changes.log")
@@ -2696,7 +2790,6 @@ def main():
         strategy = AutoExchangeStrategy(config)
         global start_time
         start_time = datetime.now(timezone.utc)
-        logging.info("✅ 策略引擎初始化完成")
 
         if strategy.api_configured:
             if not strategy.server_sync_wallet_snapshot():
@@ -2711,9 +2804,10 @@ def main():
             logging.info("🔕 仅界面模式：跳过账户同步、止盈止损检查与 BTC 日级风控")
 
         # 启动Flask服务（后台线程）
+        _flask_host = os.environ.get("AE_HOST", "127.0.0.1")
         flask_thread = threading.Thread(
             target=lambda: app.run(
-                host="0.0.0.0", port=5002, debug=False, use_reloader=False
+                host=_flask_host, port=5002, debug=False, use_reloader=False
             ),
             daemon=True,
         )
@@ -2727,17 +2821,14 @@ def main():
         # 启动扫描线程
         scan_thread = threading.Thread(target=scan_loop, daemon=True)
         scan_thread.start()
-        logging.info("✅ 信号扫描线程已启动")
 
         # 启动监控线程
         monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
         monitor_thread.start()
-        logging.info("✅ 持仓监控线程已启动")
 
         # 启动每日报告线程
         report_thread = threading.Thread(target=daily_report_loop, daemon=True)
         report_thread.start()
-        logging.info("✅ 每日报告线程已启动")
 
         logging.info("=" * 60)
         logging.info("📋 使用说明:")
@@ -2745,9 +2836,6 @@ def main():
 
         # 🔐 显示Web认证信息
         logging.info("  - Web用户名: admin")
-        logging.info("  - Web密码: admin123")
-        logging.info("  - 外部访问: http://45.77.37.106:5002")
-        logging.info("  - API服务器(旧): http://localhost:5001")
         logging.info("  - 停止程序: Ctrl+C")
         logging.info("=" * 60)
 

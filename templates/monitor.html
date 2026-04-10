@@ -4,11 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AE 监控系统</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.font.im/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/fonts/fonts.css">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=55">
-    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="/static/js/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 {% set active_nav = 'monitor' %}
@@ -102,35 +100,12 @@
                             <div class="empty-state">暂无持仓</div>
                         </div>
                     </div>
-                    <!-- 右侧：主图 -->
+                    <!-- 右侧：BTC 主图（数据来自服务端 /api/klines，无外网依赖） -->
                     <div class="chart-col-main">
                         <div class="chart-col-header">
-                            <span class="chart-col-title">📈 BTCUSDT · 日线</span>
+                            <span class="chart-col-title">📈 BTCUSDT</span>
                         </div>
-                        <div class="position-chart-container">
-                            <div class="tradingview-widget-container">
-                                <div class="tradingview-widget-container__widget"></div>
-                                <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
-{
-  "autosize": true,
-  "symbol": "BINANCE:BTCUSDT",
-  "interval": "D",
-  "timezone": "Etc/UTC",
-  "theme": "dark",
-  "style": "1",
-  "locale": "zh_CN",
-  "enable_publishing": false,
-  "allow_symbol_change": true,
-  "hide_top_toolbar": false,
-  "hide_legend": false,
-  "save_image": true,
-  "calendar": false,
-  "hide_volume": false,
-  "support_host": "https://www.tradingview.com"
-}
-                                </script>
-                            </div>
-                        </div>
+                        <div id="btc-main-chart" class="position-chart-container"></div>
                     </div>
                 </div>
                 <section class="section logs-section logs-section-right">
