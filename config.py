@@ -47,16 +47,22 @@ def _configure_binance_http_adapter(session: Optional[requests.Session]) -> None
 # ---------------------------------------------------------------------------
 # 数据库路径
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+
+# 确保 data 目录存在
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+
 CONFIG_INI_PATH = os.path.join(SCRIPT_DIR, "config.ini")
 
 # 持仓记录文件
-POSITIONS_RECORD_FILE = os.path.join(SCRIPT_DIR, "positions_record.json")
+POSITIONS_RECORD_FILE = os.path.join(DATA_DIR, "positions_record.json")
 
 # 交易历史记录文件
-TRADE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "trade_history.json")
+TRADE_HISTORY_FILE = os.path.join(DATA_DIR, "trade_history.json")
 
 # 信号历史记录文件
-SIGNAL_HISTORY_FILE = os.path.join(SCRIPT_DIR, "signal_history.json")
+SIGNAL_HISTORY_FILE = os.path.join(DATA_DIR, "signal_history.json")
 _signal_history_lock = threading.Lock()
 
 

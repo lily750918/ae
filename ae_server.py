@@ -2592,7 +2592,7 @@ def api_klines():
 
 
 def save_signal_records(signals: list, scan_time: str, opened_symbols: set):
-    """写入 signal_history.json，保留最近 90 天。
+    """写入 data/signal_history.json，保留最近 90 天。
 
     同一 (symbol, signal_time) 只保留一行：定时扫描与手动扫描在同一 UTC 小时内会重复检测
     上一完整小时，原先会追加两条；现改为合并，`opened` 取多次扫描的或（任一次建仓即为 True）。

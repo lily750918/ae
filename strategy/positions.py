@@ -21,7 +21,7 @@ class PositionsMixin:
         解决：止盈/止损在交易所成交后未走 server_close_position 导致的「幽灵持仓」。
 
         🔧 v4 修复：
-        1. 移除前写入 trade_history.json（修复 #1 交易历史丢失）
+        1. 移除前写入 data/trade_history.json（修复 #1 交易历史丢失）
         2. 取消该 symbol 所有残留的 algo 挂单（修复 #4 TP/SL 死代码）
         """
         removed = 0
@@ -155,7 +155,11 @@ class PositionsMixin:
             if removed:
                 self.server_save_positions_record()
                 logging.info(f"💾 已保存持仓记录（本次移除幽灵仓 {removed} 条）")
-                notify_positions_changed()
+                try:
+                    from ae_server import notify_positions_changed
+                    notify_positions_changed()
+                except ImportError:
+                    pass
         return removed
 
     def server_load_existing_positions(self):
@@ -358,7 +362,7 @@ class PositionsMixin:
                 logging.info("📭 无现有持仓")
 
             # 重启后从交易历史恢复今日建仓计数（避免只统计未平仓仓位导致绕过风控）
-            # 🔧 v4 修复 #11：从 trade_history.json 统计今日已建仓数
+            # 🔧 v4 修复 #11：从 data/trade_history.json 统计今日已建仓数
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_count = 0
             try:

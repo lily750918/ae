@@ -68,7 +68,7 @@
     - `order_id`（交易所订单号）
     - `tp_order_id=None`、`sl_order_id=None`（待第六阶段填充）
 18. 加锁（`_positions_sync_lock`）写入内存 `self.positions` + `daily_entries++`。
-19. 持久化到 `positions_record.json`（失败重试 3 次，全失败仅告警不影响仓位——交易所仓位优先，监控循环和重启时均可从交易所重新加载）。
+19. 持久化到 `data/positions_record.json`（失败重试 3 次，全失败仅告警不影响仓位——交易所仓位优先，监控循环和重启时均可从交易所重新加载）。
 
 ### 第六阶段：创建止盈止损
 

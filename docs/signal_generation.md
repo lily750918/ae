@@ -156,7 +156,7 @@ sorted(signals, key=lambda x: x["surge_ratio"], reverse=True)
 1. 按顺序逐个调用 `server_open_position(signal)`。
 2. 受 `max_opens_per_scan`（默认 1）限制，本轮最多成功开 1 仓。
 3. 开仓失败（风控拒绝、已持仓等）不影响后续信号尝试。
-4. 所有信号（无论是否开仓）都写入 `signal_history.json` 用于回溯。
+4. 所有信号（无论是否开仓）都写入 `data/signal_history.json` 用于回溯。
 
 ---
 

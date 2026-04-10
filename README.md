@@ -46,7 +46,7 @@ ae/
 
 1. 注册 `SIGINT` / `SIGTERM`，退出时将全局标志 `is_running` 置为 `False`。
 2. 读取 **`config.ini`**（及环境变量中的 API 密钥；密钥未配置时进入 **仅界面模式**：可开 Web，不可下单/拉行情类接口）。
-3. 构造 **`AutoExchangeStrategy`**：初始化币安客户端、策略参数、并从 **`positions_record.json`** 恢复本地持仓列表。
+3. 构造 **`AutoExchangeStrategy`**：初始化币安客户端、策略参数、并从 **`data/positions_record.json`** 恢复本地持仓列表。
 4. **若已配置 API**：
    - 同步账户余额；
    - **`server_check_and_recreate_missing_tp_sl()`**：对所有本地持仓按 **交易所开放算法单** 对账止盈/止损（见下文第 6 节），缺失则补挂；
@@ -74,7 +74,7 @@ ae/
 - 信号判定：`卖量暴涨倍数 = 上一小时卖量 / 昨日平均小时卖量`，在 `[sell_surge_threshold, sell_surge_max]` 区间内视为有效信号。
 - 额外风控：当日买量倍数落在危险区间（多空博弈）→ 过滤。
 - 信号按倍数降序排列，依次尝试开仓，受 `max_opens_per_scan` 限制。
-- 所有信号（无论是否开仓）写入 `signal_history.json` 用于回溯，保留最近 90 天。
+- 所有信号（无论是否开仓）写入 `data/signal_history.json` 用于回溯，保留最近 90 天。
 
 > 详细文档：[docs/signal_generation.md](docs/signal_generation.md)
 
@@ -148,9 +148,9 @@ ae/
 | 文件 | 作用 |
 |------|------|
 | `config.ini` | API 与策略参数（勿将密钥提交到公开仓库） |
-| `positions_record.json` | 本地持仓与订单 ID 等持久化 |
-| `trade_history.json` | 交易历史记录 |
-| `signal_history.json` | 信号扫描历史（保留 90 天） |
+| `data/positions_record.json` | 本地持仓与订单 ID 等持久化 |
+| `data/trade_history.json` | 交易历史记录 |
+| `data/signal_history.json` | 信号扫描历史（保留 90 天） |
 
 运行示例（需在项目目录下，且已安装依赖）：
 

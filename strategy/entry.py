@@ -523,7 +523,7 @@ class EntryMixin:
                 send_email_alert(
                     "持仓记录落盘失败",
                     f"{symbol} 已在交易所成功开仓，内存中已记录，"
-                    f"但 positions_record.json 写入 3 次均失败。\n"
+                    f"但 data/positions_record.json 写入 3 次均失败。\n"
                     f"止盈止损不受影响（下方继续创建）。\n"
                     f"风险：进程重启前如文件仍未更新，将从交易所重新加载持仓。",
                 )
@@ -575,7 +575,11 @@ class EntryMixin:
 ╚════════════════════════════════════════════════════════════════════════════╝
 """)
 
-            notify_positions_changed()
+            try:
+                from ae_server import notify_positions_changed
+                notify_positions_changed()
+            except ImportError:
+                pass
             return True
 
         except BinanceAPIException as e:
