@@ -240,13 +240,52 @@
   let _currentChartPos = null;
   let _currentPositions = [];
   let _lwChart = null;
+  let _priceStream = null;       // 当前价格 SSE 连接
+  let _chartCandleSeries = null; // 当前 K 线 series 引用（供价格流更新末根 K 线）
+
+  function _stopPriceStream() {
+    if (_priceStream) { _priceStream.close(); _priceStream = null; }
+  }
+
+  function _startPriceStream(symbol, candleSeries, interval) {
+    _stopPriceStream();
+    _chartCandleSeries = candleSeries;
+    const ivSeconds = interval === '4h' ? 14400 : interval === '1d' ? 86400 : 3600;
+    _priceStream = new EventSource('/api/price/stream?symbol=' + symbol);
+    _priceStream.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type !== 'price') return;
+        const price = parseFloat(msg.price);
+        if (isNaN(price)) return;
+        // 更新持仓表格中该 symbol 的 mark_price 显示
+        const rows = document.querySelectorAll('.position-row');
+        rows.forEach((row) => {
+          const sym = row.getAttribute('data-symbol');
+          if (sym !== symbol) return;
+          const cells = row.querySelectorAll('td');
+          if (cells[4]) cells[4].textContent = fmtNum(price);  // mark_price 列
+        });
+        // 更新 K 线末根 close 价（让最新蜡烛跳动）
+        if (_chartCandleSeries) {
+          const now = Math.floor(Date.now() / 1000);
+          const barTime = now - (now % ivSeconds);
+          try {
+            _chartCandleSeries.update({ time: barTime, close: price });
+          } catch (_) {}
+        }
+      } catch (_) {}
+    };
+    _priceStream.onerror = () => { _stopPriceStream(); };
+  }
 
   function setPositionChart(pos, interval) {
     const wrap = $('position-chart-widget');
     const label = $('position-chart-symbol');
     if (!wrap) return;
 
-    if (_lwChart) { _lwChart.remove(); _lwChart = null; }
+    _stopPriceStream();
+    if (_lwChart) { _lwChart.remove(); _lwChart = null; _chartCandleSeries = null; }
 
     if (!pos) {
       _currentChartSymbol = null;
@@ -352,6 +391,8 @@
         candles.createPriceLine({ price: sl, color: '#f87171', lineWidth: 1,
           lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '止损' });
       }
+      // K 线加载完成后启动实时价格流
+      _startPriceStream(symbol, candles, iv);
     });
 
     // autoSize: true 已自动处理容器尺寸变化，无需手动 ResizeObserver

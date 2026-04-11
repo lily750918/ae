@@ -163,20 +163,20 @@
   "hotPaths": [
     {
       "path": "ae_server.py",
-      "accessCount": 37,
-      "lastAccessed": 1775878957085,
+      "accessCount": 49,
+      "lastAccessed": 1775910280942,
       "type": "file"
     },
     {
       "path": "static/js/app.js",
-      "accessCount": 20,
-      "lastAccessed": 1775880457541,
+      "accessCount": 35,
+      "lastAccessed": 1775910326796,
       "type": "file"
     },
     {
       "path": "",
-      "accessCount": 20,
-      "lastAccessed": 1775882492578,
+      "accessCount": 23,
+      "lastAccessed": 1775909380611,
       "type": "directory"
     },
     {
@@ -187,8 +187,8 @@
     },
     {
       "path": "strategy/entry.py",
-      "accessCount": 11,
-      "lastAccessed": 1775883219451,
+      "accessCount": 14,
+      "lastAccessed": 1775902604110,
       "type": "file"
     },
     {
@@ -237,6 +237,12 @@
       "path": "strategy/positions.py",
       "accessCount": 4,
       "lastAccessed": 1775873443454,
+      "type": "file"
+    },
+    {
+      "path": "loops.py",
+      "accessCount": 4,
+      "lastAccessed": 1775902603357,
       "type": "file"
     },
     {
@@ -300,10 +306,16 @@
       "type": "file"
     },
     {
-      "path": "loops.py",
+      "path": "config.ini",
       "accessCount": 1,
-      "lastAccessed": 1775873319564,
+      "lastAccessed": 1775895226236,
       "type": "file"
+    },
+    {
+      "path": "state.py",
+      "accessCount": 1,
+      "lastAccessed": 1775907263181,
+      "type": "directory"
     }
   ],
   "userDirectives": []

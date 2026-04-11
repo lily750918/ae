@@ -213,18 +213,13 @@ class EntryMixin:
             logging.error(f"❌ 获取 BTC 日K {utc_day} 失败: {e}")
             return None
 
-    def check_btc_yesterday_yang_blocks_entry_live(self, signal_date=None) -> Tuple[bool, str]:
-        """昨日 BTC 日K 收涨(close>open)时，当日不建新仓（UTC 日历日；与 hm1l 一致）。失败不拦截。
-
-        signal_date: 信号 K 线所属日期（date 对象）。提供时以 signal_date - 1 作为 BTC 参考日，
-        确保跨日边界（00:03 检查前日 23:00 信号）时判断的是信号所在日的风控，而非执行日。
-        """
+    def check_btc_yesterday_yang_blocks_entry_live(self) -> Tuple[bool, str]:
+        """昨日 BTC 日K 收涨(close>open)时，当日不建新仓（UTC 日历日；与 hm1l 一致）。失败不拦截。"""
         if not getattr(self, "enable_btc_yesterday_yang_risk", True):
             return False, ""
         try:
             now = datetime.now(timezone.utc)
-            ref = signal_date if signal_date is not None else now.date()
-            yday = ref - timedelta(days=1)
+            yday = now.date() - timedelta(days=1)
             oc = self.server_get_btc_daily_open_close_for_utc_day(yday)
             if oc is None:
                 logging.warning(f"⚠️ BTC 日K 缺失 {yday}，不拦截建仓")
@@ -343,15 +338,7 @@ class EntryMixin:
 
             # BTC 昨日日K 阳线 → 当日不建新仓（与 hm1l 回测一致）
             if getattr(self, "enable_btc_yesterday_yang_risk", True):
-                # 用信号所在日判断 BTC 限制，避免跨日边界时误用执行日（如 00:03 检查昨天 23:00 信号）
-                _signal_date = None
-                try:
-                    _signal_date = datetime.strptime(
-                        signal["signal_time"], "%Y-%m-%d %H:%M:%S UTC"
-                    ).date()
-                except Exception:
-                    pass
-                skip, msg = self.check_btc_yesterday_yang_blocks_entry_live(signal_date=_signal_date)
+                skip, msg = self.check_btc_yesterday_yang_blocks_entry_live()
                 if skip:
                     logging.warning(f"🚫 {symbol} 建仓被拒: {msg}")
                     return False

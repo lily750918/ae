@@ -59,6 +59,15 @@ def scan_loop():
                     # 🔧 强制刷新日志
                     flush_logging_handlers()
 
+                    # BTC 昨日阳线风控：今日不产生开仓信号
+                    if getattr(state.strategy, "enable_btc_yesterday_yang_risk", True):
+                        skip, btc_msg = state.strategy.check_btc_yesterday_yang_blocks_entry_live()
+                        if skip:
+                            logging.warning(f"🚫 BTC风控拦截本轮扫描：{btc_msg}")
+                            last_scan_hour = current_hour
+                            time.sleep(60)
+                            continue
+
                     # 扫描信号
                     signals = state.strategy.server_scan_sell_surge_signals()
 

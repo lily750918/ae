@@ -322,6 +322,7 @@ _UI_ONLY_ALLOWED_API_PATHS = frozenset(
         "/api/signal_history_export",
         "/api/daily_report_download",
         "/api/positions/stream",
+        "/api/price/stream",
         "/api/config_editable",
         "/api/binance_credentials",
         "/api/binance_test",
@@ -993,6 +994,93 @@ def positions_stream():
             with _POSITION_SSE_LOCK:
                 try:
                     _POSITION_SSE_QUEUES.remove(q)
+                except ValueError:
+                    pass
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── 实时价格 SSE（单一轮询池，每 2 秒批量拉活跃 symbol 价格后广播）─────────────
+_PRICE_SSE_LOCK = threading.Lock()
+_PRICE_SSE_SUBS: Dict[str, List[queue.Queue]] = {}   # symbol -> [Queue, ...]
+_PRICE_BROADCASTER_STARTED = False
+
+
+def _price_broadcaster_thread():
+    """后台线程：每 2 秒批量拉取所有被订阅 symbol 的最新标记价格并推送给各订阅队列。"""
+    while True:
+        try:
+            time.sleep(2)
+            with _PRICE_SSE_LOCK:
+                symbols = [s for s, qs in _PRICE_SSE_SUBS.items() if qs]
+            if not symbols or state.strategy is None or not getattr(state.strategy, "api_configured", False):
+                continue
+            try:
+                tickers = state.strategy.client.futures_mark_price()
+                price_map = {t["symbol"]: t["markPrice"] for t in tickers if t["symbol"] in symbols}
+            except Exception:
+                continue
+            with _PRICE_SSE_LOCK:
+                for sym, qs in list(_PRICE_SSE_SUBS.items()):
+                    price = price_map.get(sym)
+                    if price is None:
+                        continue
+                    payload = {"type": "price", "symbol": sym, "price": price}
+                    dead = []
+                    for q in qs:
+                        try:
+                            q.put_nowait(payload)
+                        except queue.Full:
+                            dead.append(q)
+                    for q in dead:
+                        qs.remove(q)
+        except Exception:
+            pass
+
+
+def _ensure_price_broadcaster():
+    global _PRICE_BROADCASTER_STARTED
+    if not _PRICE_BROADCASTER_STARTED:
+        _PRICE_BROADCASTER_STARTED = True
+        t = threading.Thread(target=_price_broadcaster_thread, daemon=True, name="price-broadcaster")
+        t.start()
+
+
+@app.route("/api/price/stream")
+@auth.login_required
+def price_stream():
+    """SSE：实时推送单个 symbol 的标记价格（每 2 秒），供前端 K 线图实时更新。"""
+    symbol = request.args.get("symbol", "").upper()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+
+    _ensure_price_broadcaster()
+
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=16)
+        with _PRICE_SSE_LOCK:
+            _PRICE_SSE_SUBS.setdefault(symbol, []).append(q)
+        try:
+            yield f"data: {json.dumps({'type': 'connected', 'symbol': symbol})}\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=25.0)
+                    yield f"data: {json.dumps(msg)}\n\n"
+                except queue.Empty:
+                    yield ": ping\n\n"
+        finally:
+            with _PRICE_SSE_LOCK:
+                subs = _PRICE_SSE_SUBS.get(symbol, [])
+                try:
+                    subs.remove(q)
                 except ValueError:
                     pass
 
@@ -2637,6 +2725,17 @@ def manual_scan():
             state.strategy.account_balance = state.strategy.server_get_account_balance()
             state.strategy.account_available_balance = state.strategy.account_balance
 
+        # BTC 昨日阳线风控：今日不产生开仓信号
+        if getattr(state.strategy, "enable_btc_yesterday_yang_risk", True):
+            skip, btc_msg = state.strategy.check_btc_yesterday_yang_blocks_entry_live()
+            if skip:
+                logging.warning(f"🚫 BTC风控拦截手动扫描：{btc_msg}")
+                return jsonify({
+                    "success": True,
+                    "message": f"扫描被拒：{btc_msg}",
+                    "signals": []
+                })
+
         # 扫描信号
         signals = state.strategy.server_scan_sell_surge_signals()
 
@@ -2820,8 +2919,8 @@ def main():
         state.start_time = datetime.now(timezone.utc)
 
         if state.strategy.api_configured:
-            state.is_running = True
-            logging.info("🚀 启动时检测到 API 配置已就绪，自动开启交易模式")
+            state.is_running = False
+            logging.info("⏸️ 启动时检测到 API 配置已就绪，交易模式默认关闭，请手动开启")
             if not state.strategy.server_sync_wallet_snapshot():
                 state.strategy.account_balance = state.strategy.server_get_account_balance()
                 state.strategy.account_available_balance = state.strategy.account_balance
