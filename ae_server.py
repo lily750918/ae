@@ -1008,40 +1008,46 @@ def positions_stream():
     )
 
 
-# ── 实时价格 SSE（单一轮询池，每 2 秒批量拉活跃 symbol 价格后广播）─────────────
+# ── 实时价格 SSE（单一轮询池，每 2 秒推送所有活跃持仓价格）─────────────────────
 _PRICE_SSE_LOCK = threading.Lock()
-_PRICE_SSE_SUBS: Dict[str, List[queue.Queue]] = {}   # symbol -> [Queue, ...]
+_PRICE_SSE_QUEUES: List[queue.Queue] = []   # 所有订阅客户端的队列
 _PRICE_BROADCASTER_STARTED = False
 
 
 def _price_broadcaster_thread():
-    """后台线程：每 2 秒批量拉取所有被订阅 symbol 的最新标记价格并推送给各订阅队列。"""
+    """后台线程：每 2 秒批量拉取所有活跃持仓 symbol 的标记价格并广播给所有订阅客户端。"""
     while True:
         try:
             time.sleep(2)
             with _PRICE_SSE_LOCK:
-                symbols = [s for s, qs in _PRICE_SSE_SUBS.items() if qs]
-            if not symbols or state.strategy is None or not getattr(state.strategy, "api_configured", False):
+                if not _PRICE_SSE_QUEUES:
+                    continue
+            if state.strategy is None or not getattr(state.strategy, "api_configured", False):
+                continue
+            with state.strategy._positions_sync_lock:
+                symbols = list({p["symbol"] for p in state.strategy.positions})
+            if not symbols:
                 continue
             try:
                 tickers = state.strategy.client.futures_mark_price()
-                price_map = {t["symbol"]: t["markPrice"] for t in tickers if t["symbol"] in symbols}
+                prices = [
+                    {"type": "price", "symbol": t["symbol"], "price": t["markPrice"]}
+                    for t in tickers if t["symbol"] in symbols
+                ]
             except Exception:
                 continue
+            if not prices:
+                continue
+            payload = {"type": "prices", "data": prices}
             with _PRICE_SSE_LOCK:
-                for sym, qs in list(_PRICE_SSE_SUBS.items()):
-                    price = price_map.get(sym)
-                    if price is None:
-                        continue
-                    payload = {"type": "price", "symbol": sym, "price": price}
-                    dead = []
-                    for q in qs:
-                        try:
-                            q.put_nowait(payload)
-                        except queue.Full:
-                            dead.append(q)
-                    for q in dead:
-                        qs.remove(q)
+                dead = []
+                for q in _PRICE_SSE_QUEUES:
+                    try:
+                        q.put_nowait(payload)
+                    except queue.Full:
+                        dead.append(q)
+                for q in dead:
+                    _PRICE_SSE_QUEUES.remove(q)
         except Exception:
             pass
 
@@ -1057,19 +1063,15 @@ def _ensure_price_broadcaster():
 @app.route("/api/price/stream")
 @auth.login_required
 def price_stream():
-    """SSE：实时推送单个 symbol 的标记价格（每 2 秒），供前端 K 线图实时更新。"""
-    symbol = request.args.get("symbol", "").upper()
-    if not symbol:
-        return jsonify({"error": "symbol required"}), 400
-
+    """SSE：每 2 秒推送所有活跃持仓的最新标记价格，前端订阅一次即可更新所有持仓行。"""
     _ensure_price_broadcaster()
 
     def generate():
         q: queue.Queue = queue.Queue(maxsize=16)
         with _PRICE_SSE_LOCK:
-            _PRICE_SSE_SUBS.setdefault(symbol, []).append(q)
+            _PRICE_SSE_QUEUES.append(q)
         try:
-            yield f"data: {json.dumps({'type': 'connected', 'symbol': symbol})}\n\n"
+            yield f"data: {json.dumps({'type': 'connected'})}\n\n"
             while True:
                 try:
                     msg = q.get(timeout=25.0)
@@ -1078,9 +1080,8 @@ def price_stream():
                     yield ": ping\n\n"
         finally:
             with _PRICE_SSE_LOCK:
-                subs = _PRICE_SSE_SUBS.get(symbol, [])
                 try:
-                    subs.remove(q)
+                    _PRICE_SSE_QUEUES.remove(q)
                 except ValueError:
                     pass
 

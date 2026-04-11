@@ -243,40 +243,75 @@
   let _priceStream = null;       // 当前价格 SSE 连接
   let _chartCandleSeries = null; // 当前 K 线 series 引用（供价格流更新末根 K 线）
 
-  function _stopPriceStream() {
-    if (_priceStream) { _priceStream.close(); _priceStream = null; }
+  // ── 全局价格流：页面加载后订阅一次，推送所有活跃持仓价格 ──────────────────────
+  function startPriceStream() {
+    if (_priceStream) return;
+    (async function priceStreamLoop() {
+      while (true) {
+        try {
+          const res = await fetch('/api/price/stream', { credentials: 'same-origin' });
+          if (!res.ok || !res.body) { await new Promise((r) => setTimeout(r, 5000)); continue; }
+          _priceStream = res;
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          let buf = '';
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const blocks = buf.split('\n\n');
+            buf = blocks.pop() || '';
+            for (const block of blocks) {
+              for (const line of block.split('\n')) {
+                const t = line.trim();
+                if (!t.startsWith('data:')) continue;
+                try {
+                  const msg = JSON.parse(t.slice(5).trim());
+                  if (msg.type !== 'prices') continue;
+                  _applyPriceUpdate(msg.data);
+                } catch (_) {}
+              }
+            }
+          }
+        } catch (_) {}
+        _priceStream = null;
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    })();
   }
 
-  function _startPriceStream(symbol, candleSeries, interval) {
-    _stopPriceStream();
-    _chartCandleSeries = candleSeries;
-    const ivSeconds = interval === '4h' ? 14400 : interval === '1d' ? 86400 : 3600;
-    _priceStream = new EventSource('/api/price/stream?symbol=' + symbol);
-    _priceStream.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg.type !== 'price') return;
-        const price = parseFloat(msg.price);
-        if (isNaN(price)) return;
-        // 更新持仓表格中该 symbol 的 mark_price 显示
-        const rows = document.querySelectorAll('.position-row');
-        rows.forEach((row) => {
-          const sym = row.getAttribute('data-symbol');
-          if (sym !== symbol) return;
-          const cells = row.querySelectorAll('td');
-          if (cells[4]) cells[4].textContent = fmtNum(price);  // mark_price 列
-        });
-        // 更新 K 线末根 close 价（让最新蜡烛跳动）
-        if (_chartCandleSeries) {
-          const now = Math.floor(Date.now() / 1000);
-          const barTime = now - (now % ivSeconds);
-          try {
-            _chartCandleSeries.update({ time: barTime, close: price });
-          } catch (_) {}
+  function _applyPriceUpdate(prices) {
+    const ivSeconds = _currentChartInterval === '4h' ? 14400 : _currentChartInterval === '1d' ? 86400 : 3600;
+    for (const item of prices) {
+      const symbol = item.symbol;
+      const price = parseFloat(item.price);
+      if (isNaN(price)) continue;
+      // 更新持仓表格行
+      const pos = _currentPositions.find((p) => p.symbol === symbol);
+      document.querySelectorAll(`.position-row[data-symbol="${symbol}"]`).forEach((row) => {
+        const cells = row.querySelectorAll('td');
+        if (cells[3]) cells[3].textContent = fmtNum(price);
+        if (pos && cells[4] && cells[5]) {
+          const ep = parseFloat(pos.entry_price);
+          const qty = parseFloat(pos.quantity);
+          const dir = pos.direction;
+          if (!isNaN(ep) && ep > 0 && !isNaN(qty)) {
+            const pnl = dir === 'long' ? (price - ep) * qty : (ep - price) * qty;
+            const pnlPct = dir === 'long' ? (price - ep) / ep * 100 : (ep - price) / ep * 100;
+            cells[4].textContent = pnl.toFixed(2);
+            cells[4].className = pnlClass(pnl);
+            cells[5].textContent = pnlPct.toFixed(2) + '%';
+            cells[5].className = pnlClass(pnlPct);
+          }
         }
-      } catch (_) {}
-    };
-    _priceStream.onerror = () => { _stopPriceStream(); };
+      });
+      // 更新当前展开的 K 线末根 close
+      if (_chartCandleSeries && symbol === _currentChartSymbol) {
+        const now = Math.floor(Date.now() / 1000);
+        const barTime = now - (now % ivSeconds);
+        try { _chartCandleSeries.update({ time: barTime, close: price }); } catch (_) {}
+      }
+    }
   }
 
   function setPositionChart(pos, interval) {
@@ -284,7 +319,6 @@
     const label = $('position-chart-symbol');
     if (!wrap) return;
 
-    _stopPriceStream();
     if (_lwChart) { _lwChart.remove(); _lwChart = null; _chartCandleSeries = null; }
 
     if (!pos) {
@@ -391,8 +425,8 @@
         candles.createPriceLine({ price: sl, color: '#f87171', lineWidth: 1,
           lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '止损' });
       }
-      // K 线加载完成后启动实时价格流
-      _startPriceStream(symbol, candles, iv);
+      // 记录当前 series 引用供全局价格流更新末根 K 线
+      _chartCandleSeries = candles;
     });
 
     // autoSize: true 已自动处理容器尺寸变化，无需手动 ResizeObserver
@@ -1090,6 +1124,7 @@
     refreshData();
     loadStrategyParams();
     startPositionsStream();
+    startPriceStream();
     initBtcChart();
     // 状态栏约每 10 秒刷新；持仓列表由 SSE 在结构变化时刷新，此处仅定时补拉盈亏/价格（约 45 秒）
     setInterval(async () => {
