@@ -1,6 +1,7 @@
 """Yesterday data cache and backup symbol list extracted from ae_server.py (lines 687-810)."""
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,8 +18,13 @@ class YesterdayDataCache:
         self.cache_date = None
         logging.info("📦 初始化昨日数据缓存")
 
-    def get_yesterday_avg_sell_api(self, symbol: str) -> Optional[float]:
-        """获取昨日平均小时卖量（带缓存）- API版本"""
+    def get_yesterday_avg_sell_api(self, symbol: str, signal_date=None) -> Optional[float]:
+        """获取信号所在日前一天的平均小时卖量（带缓存）- API版本
+
+        signal_date: 信号 K 线所属的日期（UTC date）。默认为今天，
+        跨日边界（00:03-00:10 检查昨天 23:00 K 线）时需传入昨天的日期，
+        以确保基准是「信号日的前一天」而非「今天的前一天」。
+        """
         try:
             if self.client is None:
                 return None
@@ -32,12 +38,14 @@ class YesterdayDataCache:
                 self.cache = {}
                 self.cache_date = today
 
-            # 从缓存读取
-            if symbol in self.cache:
-                return self.cache[symbol]
+            # 基准日：信号所在日的前一天
+            ref_day = signal_date if signal_date is not None else today
+            yesterday = ref_day - timedelta(days=1)
 
-            # 从API获取昨日日K线
-            yesterday = today - timedelta(days=1)
+            # 缓存 key 含 yesterday 日期，避免跨日边界时混用不同基准
+            cache_key = (symbol, yesterday)
+            if cache_key in self.cache:
+                return self.cache[cache_key]
             yesterday_start = int(
                 datetime.combine(yesterday, datetime.min.time())
                 .replace(tzinfo=timezone.utc)
@@ -68,8 +76,8 @@ class YesterdayDataCache:
             total_sell = volume - active_buy_volume
             avg_hour_sell = total_sell / 24.0
 
-            # 缓存结果
-            self.cache[symbol] = avg_hour_sell
+            # 缓存结果（key 含基准日期，避免跨日边界混用不同基准）
+            self.cache[cache_key] = avg_hour_sell
 
             return avg_hour_sell
 
@@ -77,23 +85,32 @@ class YesterdayDataCache:
             logging.error(f"❌ 获取 {symbol} 昨日数据失败: {e}")
             return None
 
-    def prefetch_all(self, symbols: list):
+    def prefetch_all(self, symbols: list, signal_date=None):
         """扫描前并发预热所有 symbol 的昨日数据，避免扫描主循环中逐个发 API 请求"""
-        missing = [s for s in symbols if s not in self.cache]
+        from datetime import datetime, timezone, timedelta
+        today = datetime.now(timezone.utc).date()
+        ref_day = signal_date if signal_date is not None else today
+        yesterday = ref_day - timedelta(days=1)
+        missing = [s for s in symbols if (s, yesterday) not in self.cache]
         if not missing:
             return
-        logging.info(f"📦 开始并发预热昨日缓存，共 {len(missing)} 个交易对...")
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {
-                executor.submit(self.get_yesterday_avg_sell_api, s): s for s in missing
-            }
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except BinanceAPIException as e:
-                    logging.warning(f"预热缓存失败: {e}")
-                except Exception as e:
-                    logging.debug(f"预热缓存异常: {e}")
+        logging.info(f"📦 开始并发预热昨日缓存，共 {len(missing)} 个交易对（基准={yesterday}）...")
+        # 优化：减少并发数并增加小量延时，防止触发 IP 限制
+        batch_size = 50
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for i in range(0, len(missing), batch_size):
+                batch = missing[i : i + batch_size]
+                futures = {executor.submit(self.get_yesterday_avg_sell_api, s, signal_date): s for s in batch}
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except BinanceAPIException as e:
+                        logging.warning(f"预热缓存失败: {e}")
+                    except Exception as e:
+                        logging.debug(f"预热缓存异常: {e}")
+                # 每批次完成后稍作停顿
+                if i + batch_size < len(missing):
+                    time.sleep(0.5)
         logging.info(f"📦 昨日缓存预热完成")
 
 

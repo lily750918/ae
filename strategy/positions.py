@@ -389,6 +389,13 @@ class PositionsMixin:
                 self.last_entry_date = today
                 logging.info(f"📅 恢复今日建仓计数: {today_count}")
 
+            # 恢复 last_entry_hour：避免重启后同一小时内手动扫描绕过每小时建仓限制
+            current_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            current_hour_prefix = current_hour.strftime("%Y-%m-%dT%H:")
+            if any(p.get("entry_time", "").startswith(current_hour_prefix) for p in self.positions):
+                self.last_entry_hour = current_hour
+                logging.info(f"📅 恢复本小时建仓标记 (last_entry_hour={current_hour.strftime('%H:00 UTC')})")
+
             self.positions_loaded = True
 
         except Exception as e:

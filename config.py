@@ -31,8 +31,23 @@ from utils.logging_config import log_dir
 _BINANCE_HTTP_POOL_MAX = 32
 
 
-def _get_proxies() -> Optional[dict]:
-    """从环境变量读取代理配置（HTTPS_PROXY 优先，其次 HTTP_PROXY）。"""
+def _get_proxies(cfg: Optional[configparser.ConfigParser] = None) -> Optional[dict]:
+    """获取代理配置：
+    1. config.ini [BINANCE] proxy_url (最高优先级，可设为 "none" 禁用环境变量代理)
+    2. 环境变量 HTTPS_PROXY / HTTP_PROXY
+    """
+    if cfg is None:
+        cfg = load_config()
+
+    # 1. 优先尝试从 config.ini 获取
+    if cfg.has_section("BINANCE") and cfg.has_option("BINANCE", "proxy_url"):
+        p_url = (cfg.get("BINANCE", "proxy_url", fallback="") or "").strip()
+        if p_url.lower() == "none":
+            return None
+        if p_url:
+            return {"https": p_url, "http": p_url}
+
+    # 2. 降级到环境变量
     https = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
     http = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
     if https or http:
@@ -40,7 +55,9 @@ def _get_proxies() -> Optional[dict]:
     return None
 
 
-def _configure_binance_http_adapter(session: Optional[requests.Session]) -> None:
+def _configure_binance_http_adapter(
+    session: Optional[requests.Session], cfg: Optional[configparser.ConfigParser] = None
+) -> None:
     if session is None:
         return
     adapter = HTTPAdapter(
@@ -49,7 +66,7 @@ def _configure_binance_http_adapter(session: Optional[requests.Session]) -> None
     )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    proxies = _get_proxies()
+    proxies = _get_proxies(cfg)
     if proxies:
         session.proxies.update(proxies)
 
@@ -114,6 +131,7 @@ _CONFIG_EDITABLE_KEYS: Dict[str, Tuple[str, ...]] = {
         "enable_max_gain_24h_exit",
         "max_gain_24h_threshold",
         "max_hold_hours",
+        "enable_btc_yesterday_yang_risk",
     ),
 }
 
@@ -141,6 +159,7 @@ def _config_editable_defaults_strings() -> Dict[str, Dict[str, str]]:
             "enable_max_gain_24h_exit": "false",
             "max_gain_24h_threshold": "6.3",
             "max_hold_hours": "72",
+            "enable_btc_yesterday_yang_risk": "true",
         },
     }
 
@@ -250,6 +269,9 @@ def _validate_editable_merged(
         mhh = float(rk["max_hold_hours"])
         if not (1 <= mhh <= 720):
             return None, "max_hold_hours 应在 1–720"
+        ebyr = _parse_bool_incoming(rk["enable_btc_yesterday_yang_risk"])
+        if ebyr is None:
+            return None, "enable_btc_yesterday_yang_risk 应为 true/false"
         out["RISK"] = {
             "strong_coin_tp_pct": str(float(rk["strong_coin_tp_pct"])),
             "medium_coin_tp_pct": str(float(rk["medium_coin_tp_pct"])),
@@ -258,6 +280,7 @@ def _validate_editable_merged(
             "enable_max_gain_24h_exit": "true" if mg else "false",
             "max_gain_24h_threshold": str(mgt),
             "max_hold_hours": str(int(mhh)) if mhh == int(mhh) else str(mhh),
+            "enable_btc_yesterday_yang_risk": "true" if ebyr else "false",
         }
     except (TypeError, ValueError, KeyError) as e:
         return None, f"参数格式无效: {e}"
@@ -320,6 +343,7 @@ def _apply_normalized_editable_to_strategy(
     s.enable_max_gain_24h_exit = cp.getboolean("RISK", "enable_max_gain_24h_exit")
     s.max_gain_24h_threshold = cp.getfloat("RISK", "max_gain_24h_threshold") / 100.0
     s.max_hold_hours = cp.getfloat("RISK", "max_hold_hours")
+    s.enable_btc_yesterday_yang_risk = cp.getboolean("RISK", "enable_btc_yesterday_yang_risk")
 
     cfg = getattr(s, "config", None)
     if cfg is not None:
@@ -382,12 +406,16 @@ def _key_tail_4(k: Optional[str]) -> str:
     return k[-4:]
 
 
-def _create_binance_client(api_key: str, api_secret: str) -> Client:
+def _create_binance_client(
+    api_key: str, api_secret: str, cfg: Optional[configparser.ConfigParser] = None
+) -> Client:
     """创建 U 本位期货 Client（与 AutoExchangeStrategy.__init__ 逻辑一致，含现货 ping 绕过）。"""
-    proxies = _get_proxies()
+    proxies = _get_proxies(cfg)
     req_params = {"proxies": proxies} if proxies else {}
     if proxies:
-        logging.info("🌐 Binance Client 使用代理: %s", proxies.get("https") or proxies.get("http"))
+        logging.info(
+            "🌐 Binance Client 使用代理: %s", proxies.get("https") or proxies.get("http")
+        )
 
     last_error: Optional[Exception] = None
     for attempt in range(3):
@@ -471,9 +499,8 @@ def _sync_strategy_config_binance_from_parser(
 
 def _reinit_strategy_binance_client_after_ini_change() -> Tuple[bool, str]:
     """写入 config.ini 后按「环境变量优先」规则重建 strategy 的 client。返回 (ok, message)。"""
-    # 延迟导入 ae_server 获取全局 strategy（避免循环导入）
-    import ae_server
-    strategy = ae_server.strategy
+    import state
+    strategy = state.strategy
     if strategy is None:
         return True, "strategy 未初始化，下次启动将读取新密钥"
     cfg = load_config()
@@ -486,8 +513,8 @@ def _reinit_strategy_binance_client_after_ini_change() -> Tuple[bool, str]:
             _sync_strategy_config_binance_from_parser(strategy, cfg)
             return True, "已清除运行中的 API 客户端（当前无有效密钥）"
         try:
-            cl = _create_binance_client(k, s)
-            _configure_binance_http_adapter(getattr(cl, "session", None))
+            cl = _create_binance_client(k, s, cfg)
+            _configure_binance_http_adapter(getattr(cl, "session", None), cfg)
             cl.futures_ping()
         except Exception as e:
             return False, str(e)

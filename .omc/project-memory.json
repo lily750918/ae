@@ -163,27 +163,45 @@
   "hotPaths": [
     {
       "path": "ae_server.py",
-      "accessCount": 28,
-      "lastAccessed": 1775829103322,
+      "accessCount": 37,
+      "lastAccessed": 1775878957085,
       "type": "file"
     },
     {
       "path": "static/js/app.js",
-      "accessCount": 15,
-      "lastAccessed": 1775827760784,
+      "accessCount": 20,
+      "lastAccessed": 1775880457541,
       "type": "file"
     },
     {
       "path": "",
-      "accessCount": 10,
-      "lastAccessed": 1775825423359,
+      "accessCount": 20,
+      "lastAccessed": 1775882492578,
       "type": "directory"
     },
     {
-      "path": "config.py",
-      "accessCount": 8,
-      "lastAccessed": 1775829431143,
+      "path": "strategy/scanner.py",
+      "accessCount": 15,
+      "lastAccessed": 1775883105980,
       "type": "file"
+    },
+    {
+      "path": "strategy/entry.py",
+      "accessCount": 11,
+      "lastAccessed": 1775883219451,
+      "type": "file"
+    },
+    {
+      "path": "config.py",
+      "accessCount": 9,
+      "lastAccessed": 1775876996082,
+      "type": "file"
+    },
+    {
+      "path": "utils/cache.py",
+      "accessCount": 9,
+      "lastAccessed": 1775881919771,
+      "type": "directory"
     },
     {
       "path": "strategy/core.py",
@@ -216,9 +234,21 @@
       "type": "file"
     },
     {
+      "path": "strategy/positions.py",
+      "accessCount": 4,
+      "lastAccessed": 1775873443454,
+      "type": "file"
+    },
+    {
       "path": "templates/params.html",
       "accessCount": 3,
       "lastAccessed": 1775827978296,
+      "type": "directory"
+    },
+    {
+      "path": "strategy",
+      "accessCount": 3,
+      "lastAccessed": 1775882924414,
       "type": "directory"
     },
     {
@@ -238,12 +268,6 @@
       "accessCount": 2,
       "lastAccessed": 1775827851563,
       "type": "directory"
-    },
-    {
-      "path": "strategy/positions.py",
-      "accessCount": 1,
-      "lastAccessed": 1775825133772,
-      "type": "file"
     },
     {
       "path": "utils/daily_report.py",
@@ -273,6 +297,12 @@
       "path": "templates/_nav.html",
       "accessCount": 1,
       "lastAccessed": 1775827859373,
+      "type": "file"
+    },
+    {
+      "path": "loops.py",
+      "accessCount": 1,
+      "lastAccessed": 1775873319564,
       "type": "file"
     }
   ],

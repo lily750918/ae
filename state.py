@@ -2,8 +2,8 @@
 全局共享状态 — 供 ae_server.py、web/、loops.py 等模块引用。
 
 用法：
-    from state import strategy, is_running, start_time
-    # 修改时直接赋值：
+    # ❌ 错误用法：from state import is_running (修改后其他模块不可见)
+    # ✅ 正确用法：
     import state
     state.is_running = True
 """

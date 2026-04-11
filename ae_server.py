@@ -199,11 +199,15 @@ def _security_headers(resp):
 
 
 # 全局变量
-strategy = None
-is_running = False
-start_time = None  # 系统启动时间
+import state
 scan_thread = None
 monitor_thread = None
+
+# —— 账户信息缓存（防止高频请求） ——
+_ACCOUNT_INFO_CACHE: Dict = {}
+_ACCOUNT_INFO_CACHE_TIME = 0.0
+_ACCOUNT_INFO_LOCK = threading.Lock()
+_ACCOUNT_INFO_CACHE_TTL = 15.0  # 缓存 15 秒
 
 # 持仓变更 SSE：开仓/平仓/幽灵仓清理/改 TP·SL 时推送，供监控页刷新（减少轮询 /api/positions）
 _POSITION_SSE_LOCK = threading.Lock()
@@ -331,9 +335,9 @@ def _ui_only_block_data_apis():
         return None
     if request.path == "/api/health":
         return None
-    if strategy is None:
+    if state.strategy is None:
         return None
-    if getattr(strategy, "api_configured", True):
+    if getattr(state.strategy, "api_configured", True):
         return None
     if request.path in _UI_ONLY_ALLOWED_API_PATHS:
         return None
@@ -389,11 +393,10 @@ def api_config_editable():
         return jsonify({"success": False, "error": str(e)}), 500
 
     applied = False
-    global strategy
-    if strategy is not None:
+    if state.strategy is not None:
         try:
             with _STRATEGY_CONFIG_LOCK:
-                _apply_normalized_editable_to_strategy(strategy, normalized)
+                _apply_normalized_editable_to_strategy(state.strategy, normalized)
             applied = True
             st = normalized["STRATEGY"]
             rk = normalized["RISK"]
@@ -568,16 +571,16 @@ def api_binance_test():
 @app.route("/api/health")
 def api_health():
     """探活：无需 Basic 认证、不调用交易所（供负载均衡 / 脚本检测）。"""
-    api_ok = bool(strategy is not None and getattr(strategy, "api_configured", False))
+    api_ok = bool(state.strategy is not None and getattr(state.strategy, "api_configured", False))
     uptime_sec = None
-    if start_time is not None:
-        uptime_sec = int((datetime.now(timezone.utc) - start_time).total_seconds())
+    if state.start_time is not None:
+        uptime_sec = int((datetime.now(timezone.utc) - state.start_time).total_seconds())
     return jsonify(
         {
             "ok": True,
             "service": "ae_server",
             "api_configured": api_ok,
-            "trading": bool(is_running),
+            "trading": bool(state.is_running),
             "uptime_sec": uptime_sec,
         }
     )
@@ -587,30 +590,40 @@ def api_health():
 @app.route("/api/status")
 @auth.login_required
 def get_status():
-    """获取系统状态"""
+    """获取系统状态（带缓存，TTL 15s）"""
+    global _ACCOUNT_INFO_CACHE, _ACCOUNT_INFO_CACHE_TIME
     try:
-        if strategy is None:
+        if state.strategy is None:
             return jsonify({"error": "Strategy not initialized"}), 500
 
+        now = time.time()
+        with _ACCOUNT_INFO_LOCK:
+            # 如果缓存有效且不是强制刷新
+            if now - _ACCOUNT_INFO_CACHE_TIME < _ACCOUNT_INFO_CACHE_TTL and _ACCOUNT_INFO_CACHE:
+                result = dict(_ACCOUNT_INFO_CACHE)
+                result["running"] = state.is_running
+                result["timestamp"] = datetime.now(timezone.utc).isoformat()
+                return jsonify(result)
+
         # 获取详细账户信息
-        account_info = strategy.server_get_account_info()
+        account_info = state.strategy.server_get_account_info()
 
         # 今日统计
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         today_entries = (
-            strategy.daily_entries if strategy.last_entry_date == today else 0
+            state.strategy.daily_entries if state.strategy.last_entry_date == today else 0
         )
 
         result = {
             "success": True,
-            "api_configured": getattr(strategy, "api_configured", True),
-            "running": is_running,
-            "positions_count": len(strategy.positions),  # atomic len() on CPython — acceptable
+            "api_configured": getattr(state.strategy, "api_configured", True),
+            "running": state.is_running,
+            "positions_count": len(state.strategy.positions),
             "today_entries": today_entries,
-            "max_positions": strategy.max_positions,
-            "max_daily_entries": strategy.max_daily_entries,
+            "max_positions": state.strategy.max_positions,
+            "max_daily_entries": state.strategy.max_daily_entries,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "exchange_status": strategy.server_get_exchange_status(),
+            "exchange_status": state.strategy.server_get_exchange_status(),
         }
 
         # 添加详细账户信息
@@ -625,10 +638,15 @@ def get_status():
             )
         else:
             # 降级：如果获取详细信息失败，使用简单余额
-            balance = strategy.server_get_account_balance()
-            strategy.account_balance = balance
-            strategy.account_available_balance = balance
+            balance = state.strategy.server_get_account_balance()
+            state.strategy.account_balance = balance
+            state.strategy.account_available_balance = balance
             result["balance"] = balance
+
+        # 更新缓存
+        with _ACCOUNT_INFO_LOCK:
+            _ACCOUNT_INFO_CACHE = dict(result)
+            _ACCOUNT_INFO_CACHE_TIME = now
 
         return jsonify(result)
     except Exception as e:
@@ -647,7 +665,7 @@ def get_funding_fee():
         now = datetime.now(timezone.utc)
         start_time = int((now - timedelta(days=days)).timestamp() * 1000)
 
-        income_history = strategy.client.futures_income_history(
+        income_history = state.strategy.client.futures_income_history(
             incomeType="FUNDING_FEE", startTime=start_time, limit=1000
         )
 
@@ -690,85 +708,84 @@ def get_funding_fee():
 @app.route("/api/positions")
 @auth.login_required
 def get_positions():
-    """获取持仓详情"""
+    """获取持仓详情 (优化：批量获取价格以节省 API 权重)"""
     try:
-        if strategy is None:
+        if state.strategy is None:
             return jsonify({"error": "Strategy not initialized"}), 500
 
-        # 获取币安持仓信息
-        positions_info = strategy.client.futures_position_information()
+        # 1. 批量获取所有标记价格
+        try:
+            mark_prices_raw = state.strategy.client.futures_mark_price()
+            # 转换为 {symbol: markPrice} 映射
+            mark_prices_map = {item["symbol"]: float(item["markPrice"]) for item in mark_prices_raw}
+        except Exception as e:
+            logging.warning(f"⚠️ 批量获取标记价格失败: {e}，将使用逐个获取模式")
+            mark_prices_map = {}
+
+        # 2. 获取币安持仓信息
+        positions_info = state.strategy.client.futures_position_information()
 
         # 交易所已无仓位则从本地移除，页面与策略状态一致
-        strategy.server_prune_flat_positions_from_exchange(positions_info)
+        state.strategy.server_prune_flat_positions_from_exchange(positions_info)
 
         # 获取账户余额信息（用于计算仓位占比）
         account_balance = 0
         try:
-            account_info = strategy.client.futures_account()
+            account_info = state.strategy.client.futures_account()
             account_balance = float(account_info.get("totalWalletBalance", 0))
         except Exception as e:
             logging.error(f"❌ 获取账户余额失败: {e}")
             account_balance = 0
 
         result = []
-        with strategy._positions_sync_lock:
-            positions_snapshot = strategy.positions[:]
-        logging.debug(
-            "get_positions: strategy.positions 长度=%d", len(positions_snapshot)
-        )
+        with state.strategy._positions_sync_lock:
+            positions_snapshot = state.strategy.positions[:]
+        
+        logging.debug("get_positions: state.strategy.positions 长度=%d", len(positions_snapshot))
+        
         for pos in positions_snapshot:
             symbol = pos["symbol"]
             # 从交易所获取实时价格和盈亏
-            binance_pos = next(
-                (p for p in positions_info if p["symbol"] == symbol), None
-            )
+            binance_pos = next((p for p in positions_info if p["symbol"] == symbol), None)
+            
             try:
-                _amt = (
-                    float(binance_pos.get("positionAmt", 0) or 0)
-                    if binance_pos
-                    else 0.0
-                )
+                _amt = float(binance_pos.get("positionAmt", 0) or 0) if binance_pos else 0.0
             except (TypeError, ValueError):
                 _amt = 0.0
+            
             if abs(_amt) < 1e-8:
                 logging.debug("⏭️ %s 交易所无持仓，跳过返回", symbol)
                 continue
 
-            logging.debug("get_positions 处理持仓: %s", pos.get("symbol", "UNKNOWN"))
-
+            # 优先使用批量获取的标记价格
+            mark_price = mark_prices_map.get(symbol)
+            unrealized_pnl = 0.0
+            
             if binance_pos:
-                mark_price = float(binance_pos["markPrice"])
+                if mark_price is None:
+                    mark_price = float(binance_pos["markPrice"])
                 unrealized_pnl = float(binance_pos["unRealizedProfit"])
                 # 根据仓位方向计算盈亏百分比
-                direction = pos.get("direction", "short")  # 默认做空，保持向后兼容
+                direction = pos.get("direction", "short")
                 if direction == "long":
-                    pnl_pct = (
-                        (mark_price - pos["entry_price"]) / pos["entry_price"]
-                    ) * 100  # 做多：价格上涨盈利
+                    pnl_pct = ((mark_price - pos["entry_price"]) / pos["entry_price"]) * 100
                 else:
-                    pnl_pct = (
-                        (pos["entry_price"] - mark_price) / pos["entry_price"]
-                    ) * 100  # 做空：价格下跌盈利
+                    pnl_pct = ((pos["entry_price"] - mark_price) / pos["entry_price"]) * 100
             else:
-                # 如果交易所没有数据，用市价
-                ticker = strategy.client.futures_symbol_ticker(symbol=symbol)
-                mark_price = float(ticker["price"])
-                # 根据仓位方向计算盈亏百分比
-                direction = pos.get("direction", "short")  # 默认做空，保持向后兼容
+                # 如果批量获取和 binance_pos 都没有，才逐个查询（极少发生）
+                if mark_price is None:
+                    ticker = state.strategy.client.futures_symbol_ticker(symbol=symbol)
+                    mark_price = float(ticker["price"])
+                
+                direction = pos.get("direction", "short")
                 if direction == "long":
-                    pnl_pct = (
-                        (mark_price - pos["entry_price"]) / pos["entry_price"]
-                    ) * 100  # 做多：价格上涨盈利
+                    pnl_pct = ((mark_price - pos["entry_price"]) / pos["entry_price"]) * 100
                 else:
-                    pnl_pct = (
-                        (pos["entry_price"] - mark_price) / pos["entry_price"]
-                    ) * 100  # 做空：价格下跌盈利
-                unrealized_pnl = (
-                    pnl_pct / 100 * pos["position_value"] * strategy.leverage
-                )
+                    pnl_pct = ((pos["entry_price"] - mark_price) / pos["entry_price"]) * 100
+                unrealized_pnl = (pnl_pct / 100 * pos["position_value"] * state.strategy.leverage)
 
             # 💰 计算新增字段
-            leverage = int(pos.get("leverage", strategy.leverage))
+            leverage = int(pos.get("leverage", state.strategy.leverage))
             quantity = pos["quantity"]
             entry_price = pos["entry_price"]
 
@@ -785,7 +802,7 @@ def get_positions():
 
             # 获取挂单（与下方 get_tp_sl 共用，避免每轮轮询同一 symbol 打两次算法单 API）
             try:
-                algo_orders = strategy.client.futures_get_open_algo_orders(
+                algo_orders = state.strategy.client.futures_get_open_algo_orders(
                     symbol=symbol
                 )
                 orders = []
@@ -850,7 +867,7 @@ def get_positions():
 
                 if tp_price_val == "N/A" or sl_price_val == "N/A":
                     try:
-                        all_orders = strategy.client.futures_get_open_orders(
+                        all_orders = state.strategy.client.futures_get_open_orders(
                             symbol=symbol
                         )
                         logging.debug("🔍 %s 普通挂单: %d 条", symbol, len(all_orders))
@@ -915,7 +932,7 @@ def get_positions():
                     "pnl": unrealized_pnl,
                     "pnl_pct": pnl_pct,
                     "leverage": leverage,
-                    "tp_pct": pos.get("tp_pct", strategy.strong_coin_tp_pct),
+                    "tp_pct": pos.get("tp_pct", state.strategy.strong_coin_tp_pct),
                     "orders": orders,
                     "elapsed_hours": elapsed_hours,
                     "tp_2h_checked": pos.get("tp_2h_checked", False),
@@ -1050,6 +1067,8 @@ def _log_line_ok_for_monitor(line: str) -> bool:
 _POSITION_CHANGE_LOG_STD_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - INFO - \[仓位变动\] "
 )
+# 提取日志行时间戳（用于跨文件统一排序）
+_LOG_LINE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})")
 
 
 def _position_changes_line_for_monitor(s: str) -> bool:
@@ -1129,16 +1148,14 @@ def get_logs():
                     else:
                         log_file_name = f"{log_file_name} | position_changes.log(标准行{len(position_snippet)}条)"
 
-        out_lines: List[str] = []
-        if position_snippet:
-            out_lines.append("--- 仓位变动（仅单行标准格式，旧版多行块已忽略） ---")
-            out_lines.extend(position_snippet)
-            out_lines.append(
-                "--- ae_server 主日志（要点"
-                + ("，未过滤" if full_tail else "，已过滤噪音")
-                + "）---"
-            )
-        out_lines.extend(last_lines)
+        def _line_ts(ln: str) -> str:
+            m = _LOG_LINE_TS_RE.match(ln.strip())
+            return m.group(1) if m else ""
+
+        # 按时间戳合并两个来源，统一降序（最新在前）
+        merged_all = list(dict.fromkeys(position_snippet + last_lines))  # 去重保序
+        merged_all.sort(key=_line_ts, reverse=True)
+        out_lines: List[str] = merged_all
 
         return jsonify(
             {
@@ -1231,17 +1248,17 @@ def search_logs():
 def api_close_position():
     """手动平仓 - API端点"""
     try:
-        if strategy is None:
+        if state.strategy is None:
             return jsonify({"error": "Strategy not initialized"}), 500
-
+        s = state.strategy
         data = request.get_json(silent=True) or {}
         symbol = (data.get("symbol") or "").strip().upper()
         if not re.fullmatch(r"[A-Z0-9]{2,20}", symbol):
             return jsonify({"error": "无效的 symbol 参数"}), 400
 
         # 查找持仓（快照查找，避免迭代时被其他线程修改列表）
-        with strategy._positions_sync_lock:
-            position = next((p for p in strategy.positions if p["symbol"] == symbol), None)
+        with state.strategy._positions_sync_lock:
+            position = next((p for p in state.strategy.positions if p["symbol"] == symbol), None)
 
         if not position:
             return jsonify({"error": f"{symbol} not found"}), 404
@@ -1250,18 +1267,18 @@ def api_close_position():
         before_state = {
             "持仓数量": position["quantity"],
             "建仓价格": position["entry_price"],
-            "当前价格": strategy.client.futures_symbol_ticker(symbol=symbol)["price"],
+            "当前价格": state.strategy.client.futures_symbol_ticker(symbol=symbol)["price"],
             "未实现盈亏": position.get("pnl", 0),
         }
 
         # 执行平仓
-        strategy.server_close_position(position, "manual_close")
+        state.strategy.server_close_position(position, "manual_close")
 
         # 记录变动后状态
         after_state = {"持仓数量": 0, "状态": "已平仓"}
 
         # 统一日志记录
-        strategy.server_log_position_change(
+        state.strategy.server_log_position_change(
             "manual_close",
             symbol,
             {
@@ -1287,7 +1304,7 @@ def api_close_position():
 def update_tp_sl():
     """修改止盈止损（支持精确定位position_id，解决重复持仓问题）"""
     try:
-        if strategy is None:
+        if state.strategy is None:
             return jsonify(
                 {
                     "success": False,
@@ -1308,9 +1325,9 @@ def update_tp_sl():
 
         # ✨ 优先通过position_id查找（精确匹配）
         if position_id:
-            with strategy._positions_sync_lock:
+            with state.strategy._positions_sync_lock:
                 position = next(
-                    (p for p in strategy.positions if p.get("position_id") == position_id),
+                    (p for p in state.strategy.positions if p.get("position_id") == position_id),
                     None,
                 )
             if not position:
@@ -1326,9 +1343,9 @@ def update_tp_sl():
             )
         elif symbol:
             # 兼容旧版本：通过symbol查找（如有多个持仓会有歧义）
-            with strategy._positions_sync_lock:
+            with state.strategy._positions_sync_lock:
                 matching_positions = [
-                    p for p in strategy.positions if p["symbol"] == symbol
+                    p for p in state.strategy.positions if p["symbol"] == symbol
                 ]
             if not matching_positions:
                 return jsonify(
@@ -1375,7 +1392,7 @@ def update_tp_sl():
 
         # 🔧 从交易所获取实际持仓数量（避免数量不一致问题）
         try:
-            positions_info = strategy.client.futures_position_information(symbol=symbol)
+            positions_info = state.strategy.client.futures_position_information(symbol=symbol)
             actual_position = next(
                 (p for p in positions_info if p["symbol"] == symbol), None
             )
@@ -1430,7 +1447,7 @@ def update_tp_sl():
             # 预清理算法单（止盈/止损在 openAlgoOrders，记录的 ID 常为 algoId）
             cs_pre = position_close_side(is_long_position)
             try:
-                _aos = strategy.client.futures_get_open_algo_orders(symbol=symbol)
+                _aos = state.strategy.client.futures_get_open_algo_orders(symbol=symbol)
                 for ao in _aos:
                     if ao.get("side") != cs_pre:
                         continue
@@ -1442,7 +1459,7 @@ def update_tp_sl():
                         sl_price and ot in FUTURES_ALGO_SL_TYPES
                     ):
                         try:
-                            strategy.client.futures_cancel_algo_order(
+                            state.strategy.client.futures_cancel_algo_order(
                                 symbol=symbol, algoId=aid
                             )
                             logging.info(f"🧹 {symbol} 预取消算法单 {ot} algoId={aid}")
@@ -1452,7 +1469,7 @@ def update_tp_sl():
                 logging.warning(f"⚠️ {symbol} 预清理算法单失败: {_pre_err}")
 
             # 🔧 修复：智能取消订单逻辑 - 只取消属于当前持仓的订单
-            all_orders = strategy.client.futures_get_open_orders(symbol=symbol)
+            all_orders = state.strategy.client.futures_get_open_orders(symbol=symbol)
             tp_order_count = len(
                 [
                     o
@@ -1488,7 +1505,7 @@ def update_tp_sl():
             if recorded_tp_id and tp_price:
                 logging.info(f"🔍 {symbol} 尝试取消记录的止盈订单ID: {recorded_tp_id}")
                 if cancel_order_algo_or_regular(
-                    strategy.client, symbol, str(recorded_tp_id)
+                    state.strategy.client, symbol, str(recorded_tp_id)
                 ):
                     cancelled_tp_orders.append(str(recorded_tp_id))
                     logging.info(
@@ -1502,7 +1519,7 @@ def update_tp_sl():
             if recorded_sl_id and sl_price:
                 logging.info(f"🔍 {symbol} 尝试取消记录的止损订单ID: {recorded_sl_id}")
                 if cancel_order_algo_or_regular(
-                    strategy.client, symbol, str(recorded_sl_id)
+                    state.strategy.client, symbol, str(recorded_sl_id)
                 ):
                     cancelled_sl_orders.append(str(recorded_sl_id))
                     logging.info(
@@ -1515,7 +1532,7 @@ def update_tp_sl():
 
             # 步骤2：通过智能匹配取消剩余的订单（防止重复订单）
             # 重新查询订单（因为上面可能取消了一些）
-            all_orders = strategy.client.futures_get_open_orders(symbol=symbol)
+            all_orders = state.strategy.client.futures_get_open_orders(symbol=symbol)
             logging.info(f"🔍 {symbol} 重新查询后还有 {len(all_orders)} 个订单")
 
             for order in all_orders:
@@ -1606,7 +1623,7 @@ def update_tp_sl():
                         logging.info(
                             f"🚀 {symbol} 正在取消订单: {order_type} {order_id} ({cancel_reason})"
                         )
-                        cancel_result = strategy.client.futures_cancel_order(
+                        cancel_result = state.strategy.client.futures_cancel_order(
                             symbol=symbol, orderId=order["orderId"]
                         )
                         logging.info(f"📋 {symbol} 取消API响应: {cancel_result}")
@@ -1641,7 +1658,7 @@ def update_tp_sl():
                             logging.info(
                                 f"🚨 {symbol} 宽松取消止盈订单: {order.get('orderId')} (类型: {order.get('type')}, 方向: {order.get('side')}, 数量: {order.get('origQty')})"
                             )
-                            cancel_result = strategy.client.futures_cancel_order(
+                            cancel_result = state.strategy.client.futures_cancel_order(
                                 symbol=symbol, orderId=order["orderId"]
                             )
                             logging.info(
@@ -1665,7 +1682,7 @@ def update_tp_sl():
                             logging.info(
                                 f"🚨 {symbol} 宽松取消止损订单: {order.get('orderId')} (类型: {order.get('type')}, 方向: {order.get('side')}, 数量: {order.get('origQty')})"
                             )
-                            cancel_result = strategy.client.futures_cancel_order(
+                            cancel_result = state.strategy.client.futures_cancel_order(
                                 symbol=symbol, orderId=order["orderId"]
                             )
                             logging.info(
@@ -1688,7 +1705,7 @@ def update_tp_sl():
 
         # 🔧 动态获取价格精度（修复COMPUSDT、LPTUSDT等币种的精度错误）
         try:
-            exchange_info = strategy.client.futures_exchange_info()
+            exchange_info = state.strategy.client.futures_exchange_info()
             symbol_info = next(
                 (s for s in exchange_info["symbols"] if s["symbol"] == symbol), None
             )
@@ -1748,7 +1765,7 @@ def update_tp_sl():
                 logging.info(
                     f"🚀 {symbol} 创建止盈算法单: TAKE_PROFIT_MARKET side={tp_side} trigger={tp_trig}"
                 )
-                tp_order = strategy.client.futures_create_algo_order(
+                tp_order = state.strategy.client.futures_create_algo_order(
                     symbol=symbol,
                     side=tp_side,
                     type="TAKE_PROFIT_MARKET",
@@ -1777,7 +1794,7 @@ def update_tp_sl():
                     )
                     try:
                         time.sleep(0.5)
-                        aos = strategy.client.futures_get_open_algo_orders(
+                        aos = state.strategy.client.futures_get_open_algo_orders(
                             symbol=symbol
                         )
                         for order in aos:
@@ -1835,7 +1852,7 @@ def update_tp_sl():
                 logging.info(
                     f"🚀 {symbol} 创建止损算法单: STOP_MARKET side={sl_side} trigger={sl_trig}"
                 )
-                sl_order = strategy.client.futures_create_algo_order(
+                sl_order = state.strategy.client.futures_create_algo_order(
                     symbol=symbol,
                     side=sl_side,
                     type="STOP_MARKET",
@@ -1862,7 +1879,7 @@ def update_tp_sl():
                     )
                     try:
                         time.sleep(0.5)
-                        aos = strategy.client.futures_get_open_algo_orders(
+                        aos = state.strategy.client.futures_get_open_algo_orders(
                             symbol=symbol
                         )
                         for order in aos:
@@ -1933,7 +1950,7 @@ def update_tp_sl():
                 sl_price_adjusted if "sl_price_adjusted" in locals() else sl_price
             )
 
-        strategy.server_log_position_change(
+        state.strategy.server_log_position_change(
             "manual_tp_sl",
             symbol,
             details,
@@ -1952,7 +1969,7 @@ def update_tp_sl():
         )
 
         # 保存记录
-        strategy.server_save_positions_record()
+        state.strategy.server_save_positions_record()
 
         # 🔧 修复：根据验证结果和请求参数判断实际成功状态
         # 只有请求修改的订单需要验证成功，未请求修改的订单不影响结果
@@ -1993,9 +2010,8 @@ def update_tp_sl():
 def cancel_order():
     """取消订单"""
     try:
-        if strategy is None:
+        if state.strategy is None:
             return jsonify({"error": "Strategy not initialized"}), 500
-
         data = request.get_json(silent=True) or {}
         symbol = (data.get("symbol") or "").strip().upper()
         order_id = data.get("order_id")
@@ -2004,7 +2020,7 @@ def cancel_order():
         if not order_id:
             return jsonify({"error": "order_id 不能为空"}), 400
 
-        if not cancel_order_algo_or_regular(strategy.client, symbol, str(order_id)):
+        if not cancel_order_algo_or_regular(state.strategy.client, symbol, str(order_id)):
             return jsonify({"error": "取消订单失败（算法单与普通单均尝试失败）"}), 400
 
         logging.info(f"✅ Web界面取消订单: {symbol} - {order_id}")
@@ -2083,9 +2099,9 @@ def get_position_logs():
 def get_strategy_params():
     """获取策略运行参数"""
     try:
-        if strategy is None:
+        if state.strategy is None:
             return jsonify({"error": "Strategy not initialized"}), 500
-        s = strategy
+        s = state.strategy
         return jsonify(
             {
                 "success": True,
@@ -2490,13 +2506,11 @@ def export_signal_history_csv():
 @auth.login_required
 def start_trading():
     """启动自动交易"""
-    global is_running
-
     try:
         logging.info("📥 收到 Web 请求: 启动交易 (POST /api/start_trading)")
         flush_logging_handlers()
 
-        if strategy is None or not getattr(strategy, "api_configured", False):
+        if state.strategy is None or not getattr(state.strategy, "api_configured", False):
             logging.warning("⚠️ 启动交易被拒绝: 未配置 API")
             flush_logging_handlers()
             return jsonify(
@@ -2506,13 +2520,13 @@ def start_trading():
                 }
             ), 400
         # 🔒 使用原子操作防止并发启动
-        if is_running:
+        if state.is_running:
             logging.warning("⚠️ 启动交易已忽略: 当前已是运行中 (is_running=True)")
             flush_logging_handlers()
             return jsonify({"success": False, "message": "已经在运行中"})
 
         # 扫描/监控线程由 main() 在进程启动时已创建；此处只打开开关，避免重复线程导致同一动作执行两遍
-        is_running = True
+        state.is_running = True
         logging.info(
             "🚀 Web 界面: 自动交易已启动（复用已有 scan_loop / monitor_loop 线程，is_running=True）"
         )
@@ -2580,14 +2594,12 @@ def daily_report_download():
 @auth.login_required
 def stop_trading():
     """停止自动交易"""
-    global is_running
-
     try:
-        was_running = is_running
+        was_running = state.is_running
         logging.info("📥 收到 Web 请求: 停止交易 (POST /api/stop_trading)")
         flush_logging_handlers()
 
-        is_running = False
+        state.is_running = False
 
         if was_running:
             logging.info(
@@ -2612,30 +2624,47 @@ def stop_trading():
 def manual_scan():
     """手动扫描"""
     try:
-        if strategy is None:
+        if state.strategy is None:
             return jsonify({"error": "Strategy not initialized"}), 500
-        if not getattr(strategy, "api_configured", False):
+        if not getattr(state.strategy, "api_configured", False):
             return jsonify(
                 {"success": False, "error": "未配置 API 密钥，无法扫描或建仓"}
             ), 400
 
         logging.info("🔍 Web界面触发手动扫描...")
 
-        if not strategy.server_sync_wallet_snapshot():
-            strategy.account_balance = strategy.server_get_account_balance()
-            strategy.account_available_balance = strategy.account_balance
+        if not state.strategy.server_sync_wallet_snapshot():
+            state.strategy.account_balance = state.strategy.server_get_account_balance()
+            state.strategy.account_available_balance = state.strategy.account_balance
 
         # 扫描信号
-        signals = strategy.server_scan_sell_surge_signals()
+        signals = state.strategy.server_scan_sell_surge_signals()
 
         # 尝试建仓（与 hm1l 一致：按倍数排序后连续尝试，直至额度/扫描上限）
         opened_count = 0
         opened_syms = set()
-        cap = strategy.max_opens_per_scan
+        cap = state.strategy.max_opens_per_scan
+        
+        # 🔒 手动扫描也受“每小时建仓限制”约束
+        if state.strategy.enable_hourly_entry_limit:
+            current_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            leh = state.strategy.last_entry_hour
+            if leh and not leh.tzinfo: leh = leh.replace(tzinfo=timezone.utc)
+            
+            if leh == current_hour:
+                logging.warning("⚠️ Web界面手动建仓被拒: 本小时已建仓，请等待下一个小时")
+                return jsonify({
+                    "success": True, 
+                    "message": "扫描完成，但受限于「每小时建仓限制」，本小时无法再次开仓。",
+                    "signals": signals
+                })
+
+
+
         for signal in signals:
             if cap > 0 and opened_count >= cap:
                 break
-            if strategy.server_open_position(signal):
+            if state.strategy.server_open_position(signal):
                 opened_count += 1
                 opened_syms.add(signal["symbol"])
 
@@ -2662,12 +2691,12 @@ def manual_scan():
 def api_klines():
     """返回合约 K 线数据，供前端 Lightweight Charts 使用"""
     try:
-        if strategy is None or not getattr(strategy, "api_configured", False):
+        if state.strategy is None or not getattr(state.strategy, "api_configured", False):
             return jsonify({"success": False, "error": "未配置 API"}), 503
         symbol = request.args.get("symbol", "BTCUSDT").upper()
         interval = request.args.get("interval", "1h")
         limit = min(int(request.args.get("limit", 200)), 500)
-        klines = strategy.client.futures_klines(
+        klines = state.strategy.client.futures_klines(
             symbol=symbol, interval=interval, limit=limit
         )
         data = [
@@ -2758,10 +2787,8 @@ from loops import scan_loop, monitor_loop, daily_report_loop
 # ==================== 信号处理 ====================
 def signal_handler(sig, frame):
     """处理Ctrl+C信号"""
-    global is_running
-
     logging.info("\n⏹️ 收到停止信号，正在退出...")
-    is_running = False
+    state.is_running = False
 
     # 给线程1秒时间退出
     time.sleep(1)
@@ -2773,7 +2800,7 @@ def signal_handler(sig, frame):
 # ==================== 主程序 ====================
 def main():
     """主函数"""
-    global strategy, is_running, scan_thread, monitor_thread
+    global scan_thread, monitor_thread
 
     # 注册信号处理
     signal.signal(signal.SIGINT, signal_handler)
@@ -2789,17 +2816,18 @@ def main():
         logging.info("✅ 配置文件加载成功")
 
         # 初始化策略引擎
-        strategy = AutoExchangeStrategy(config)
-        global start_time
-        start_time = datetime.now(timezone.utc)
+        state.strategy = AutoExchangeStrategy(config)
+        state.start_time = datetime.now(timezone.utc)
 
-        if strategy.api_configured:
-            if not strategy.server_sync_wallet_snapshot():
-                strategy.account_balance = strategy.server_get_account_balance()
-                strategy.account_available_balance = strategy.account_balance
-            strategy.server_check_and_recreate_missing_tp_sl()
+        if state.strategy.api_configured:
+            state.is_running = True
+            logging.info("🚀 启动时检测到 API 配置已就绪，自动开启交易模式")
+            if not state.strategy.server_sync_wallet_snapshot():
+                state.strategy.account_balance = state.strategy.server_get_account_balance()
+                state.strategy.account_available_balance = state.strategy.account_balance
+            state.strategy.server_check_and_recreate_missing_tp_sl()
             try:
-                strategy.server_maybe_btc_yesterday_yang_flatten_at_new_utc_day()
+                state.strategy.server_maybe_btc_yesterday_yang_flatten_at_new_utc_day()
             except Exception as e:
                 logging.error(f"❌ 启动时 BTC 昨日阳线一刀切检查失败: {e}")
         else:
@@ -2845,12 +2873,12 @@ def main():
         while True:
             time.sleep(60)
             # 每分钟输出一次状态
-            if is_running:
-                if strategy is not None and getattr(strategy, "api_configured", False):
-                    strategy.server_sync_wallet_snapshot()
+            if state.is_running:
+                if state.strategy is not None and getattr(state.strategy, "api_configured", False):
+                    state.strategy.server_sync_wallet_snapshot()
                 logging.info(
-                    f"💓 系统运行中... 持仓: {len(strategy.positions)}, "
-                    f"余额: ${strategy.account_balance:.2f}  可用余额: ${strategy.account_available_balance:.2f}"
+                    f"💓 系统运行中... 持仓: {len(state.strategy.positions)}, "
+                    f"余额: ${state.strategy.account_balance:.2f}  可用余额: ${state.strategy.account_available_balance:.2f}"
                 )
                 # 🔧 强制刷新日志
                 flush_logging_handlers()

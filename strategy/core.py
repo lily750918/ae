@@ -131,7 +131,9 @@ class StrategyCore:
             if not client_ready:
                 raise RuntimeError("无法创建币安客户端")
 
-            _configure_binance_http_adapter(getattr(self.client, "session", None))
+            _configure_binance_http_adapter(
+                getattr(self.client, "session", None), self.config
+            )
 
             try:
                 self.client.futures_ping()
@@ -224,10 +226,14 @@ class StrategyCore:
         )
         self.cooldown_hours = config.getfloat("RISK", "cooldown_hours", fallback=4.0)
 
-        # ========== BTC 日线风控（与 top2/hm1l.py 对齐，写在代码内不读 config.ini）==========
+        # ========== BTC 日线风控（与 top2/hm1l.py 对齐，改为可配置）==========
         # 昨日 BTC 日K 收>开 → 当日不建新仓；→ 新 UTC 日首次评估时一刀切平掉程序管理的空仓（市价）
-        self.enable_btc_yesterday_yang_no_new_entry = True
-        self.enable_btc_yesterday_yang_flatten_at_open = True
+        self.enable_btc_yesterday_yang_risk = config.getboolean(
+            "RISK", "enable_btc_yesterday_yang_risk", fallback=True
+        )
+        # 兼容旧代码引用，实际由 enable_btc_yesterday_yang_risk 统一控制
+        self.enable_btc_yesterday_yang_no_new_entry = self.enable_btc_yesterday_yang_risk
+        self.enable_btc_yesterday_yang_flatten_at_open = self.enable_btc_yesterday_yang_risk
         self._last_btc_yang_flatten_eval_utc_date: Optional[date] = (
             None  # 本 UTC 日是否已成功拉取昨日日K并评估
         )
@@ -277,6 +283,9 @@ class StrategyCore:
             f"   杠杆: {self.leverage}x, 单仓: {self.position_size_ratio * 100:.0f}%, 最大持仓: {self.max_positions}"
         )
         logging.info(
+            f"   信号阈值: {self.sell_surge_threshold}x - {self.sell_surge_max}x"
+        )
+        logging.info(
             f"   止盈: {self.strong_coin_tp_pct}/{self.medium_coin_tp_pct}/{self.weak_coin_tp_pct}%, 止损: {self.stop_loss_pct}%"
         )
         logging.info(
@@ -285,8 +294,7 @@ class StrategyCore:
             f"单次扫描最多开仓: {self.max_opens_per_scan or '不限制'}"
         )
         logging.info(
-            f"   BTC昨日阳线风控: 不建新仓={self.enable_btc_yesterday_yang_no_new_entry} | "
-            f"UTC日初一刀切空仓={self.enable_btc_yesterday_yang_flatten_at_open}"
+            f"   BTC昨日阳线风控: {self.enable_btc_yesterday_yang_risk}"
         )
 
     # ------------------------------------------------------------------

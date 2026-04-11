@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 from binance.client import Client
 
 from utils.logging_config import log_dir
+import state
 from utils.email import ALERT_EMAIL
 
 
@@ -87,10 +88,9 @@ def _fetch_futures_realized_pnl_window(
 
 def generate_daily_report() -> str:
     """生成每日交易报告"""
-    import ae_server
-    strategy = ae_server.strategy
-    is_running = ae_server.is_running
-    start_time = ae_server.start_time
+    strategy = state.strategy
+    is_running = state.is_running
+    start_time = state.start_time
 
     try:
         report_lines = []

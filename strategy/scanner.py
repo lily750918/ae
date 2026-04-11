@@ -67,9 +67,9 @@ class ScannerMixin:
             # 建仓时间 = 信号时间 + 1小时（第2小时）
             entry_dt = signal_dt + timedelta(hours=1)
 
-            # 步骤1：获取昨日平均小时卖量（从缓存）
+            # 步骤1：获取信号所在日前一天的平均小时卖量（基准 = signal_dt 的前一天）
             yesterday_avg_hour_sell = self.yesterday_cache.get_yesterday_avg_sell_api(
-                symbol
+                symbol, signal_date=signal_dt.date()
             )
             if not yesterday_avg_hour_sell or yesterday_avg_hour_sell <= 0:
                 logging.debug(f"❌ {symbol} 昨日数据缺失，无法判断连续确认")
@@ -401,7 +401,7 @@ class ScannerMixin:
         return self._exchange_info_cache.get(symbol)
 
     def server_scan_sell_surge_signals(self) -> List[Dict]:
-        """扫描卖量暴涨信号（API实时版本）- 服务器版本"""
+        """扫描卖量暴涨信号（API实时版本）- 服务器版本（优化：分批并发 + 价格预取）"""
         try:
             logging.info("🔍 开始扫描卖量暴涨信号（API模式）...")
             signals = []
@@ -414,18 +414,31 @@ class ScannerMixin:
             symbols = self._server_get_active_symbols()
             logging.info(f"📊 开始扫描 {len(symbols)} 个交易对...")
 
-            # 并发预热昨日数据缓存，避免扫描主循环中逐个发 API 请求
-            self.yesterday_cache.prefetch_all(symbols)
+            # 优化：批量获取当前所有交易对价格，供信号价格 fallback 使用
+            try:
+                tickers = self.client.futures_symbol_ticker()
+                prices_map = {t["symbol"]: float(t["price"]) for t in tickers}
+            except Exception as e:
+                logging.warning(f"⚠️ 扫描预取所有价格失败: {e}")
+                prices_map = {}
 
+            # 信号 K 线所在小时（上一个完整小时）
             check_hour = current_hour - timedelta(hours=1)
             check_hour_ms = int(check_hour.timestamp() * 1000)
+            # 信号所在日期（跨日边界时为昨天，其余时间为今天）
+            signal_date = check_hour.date()
+
+            # 并发预热昨日数据缓存，避免扫描主循环中逐个发 API 请求
+            # 传入 signal_date 确保跨日边界时基准为前天而非昨天
+            self.yesterday_cache.prefetch_all(symbols, signal_date=signal_date)
+
 
             def _scan_one(symbol: str) -> Optional[Dict]:
                 """扫描单个交易对，返回信号 dict 或 None"""
                 try:
-                    # 1. 从缓存获取昨日平均小时卖量（预热后命中缓存，无网络请求）
+                    # 1. 从缓存获取信号所在日前一天的平均小时卖量
                     yesterday_avg_hour_sell = (
-                        self.yesterday_cache.get_yesterday_avg_sell_api(symbol)
+                        self.yesterday_cache.get_yesterday_avg_sell_api(symbol, signal_date=signal_date)
                     )
                     if not yesterday_avg_hour_sell or yesterday_avg_hour_sell <= 0:
                         return None
@@ -445,6 +458,7 @@ class ScannerMixin:
                     hour_kline = klines[0]
                     # 校验K线时间戳，防止API因历史数据缺失顺延返回"当前小时"被误认为"上一小时"
                     if int(hour_kline[0]) != check_hour_ms:
+                        logging.debug(f"⏭️ {symbol} 时间戳不匹配: 预期 {check_hour_ms}, 实际 {hour_kline[0]}")
                         return None
 
                     hour_volume = float(hour_kline[5])  # 总成交量
@@ -464,14 +478,10 @@ class ScannerMixin:
                     # 获取信号价格（使用下一小时开盘价，如果存在）
                     if len(klines) >= 2:
                         signal_price = float(klines[1][1])  # 下一小时开盘价
-                        logging.info(
-                            f"📊 {symbol} 信号价格: 使用下一小时开盘价 {signal_price:.6f}"
-                        )
                     else:
-                        signal_price = hour_close
-                        logging.info(
-                            f"📊 {symbol} 信号价格: 下一小时未生成，使用当前小时收盘价 {signal_price:.6f}"
-                        )
+                        # 优化：优先使用批量预取的实时价格
+                        signal_price = prices_map.get(symbol, hour_close)
+                        logging.debug(f"📊 {symbol} 信号价格: 使用预取价格/收盘价 {signal_price:.6f}")
 
                     # 🆕 检查当日买量倍数风控
                     signal_time_utc = datetime.fromtimestamp(
@@ -525,20 +535,46 @@ class ScannerMixin:
                     logging.warning(f"扫描 {symbol} 异常: {e}")
                     return None
 
-            # 并发扫描所有交易对（max_workers=10 控制并发，匹配底层连接池以免阻塞）
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                futures_map = {executor.submit(_scan_one, sym): sym for sym in symbols}
-                for future in as_completed(futures_map):
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            signals.append(result)
-                    except BinanceAPIException as e:
-                        logging.warning(f"并发扫描异常(API): {e}")
-                    except (OSError, TimeoutError) as e:
-                        logging.warning(f"并发扫描网络错误: {e}")
+            # 优化：分批并发扫描（max_workers=5 控制并发，每批次增加 0.2s 延时）
+            batch_size = 50
+            all_ratios = [] # 记录所有交易对的倍数，用于诊断
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                for i in range(0, len(symbols), batch_size):
+                    batch = symbols[i : i + batch_size]
+                    futures_map = {executor.submit(_scan_one, sym): sym for sym in batch}
+                    for future in as_completed(futures_map):
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                signals.append(result)
+                                all_ratios.append((result["symbol"], result["surge_ratio"]))
+                            else:
+                                # 如果没有信号，也尝试记录一下该 symbol 的倍数（通过重读缓存）
+                                sym = futures_map[future]
+                                yesterday_avg = self.yesterday_cache.cache.get(sym)
+                                if yesterday_avg and yesterday_avg > 0:
+                                    # 这里只是为了记录，不重新发请求
+                                    pass
+                        except Exception as e:
+                            logging.warning(f"并发扫描异常: {e}")
+                    
+                    # 批次间停顿，平滑 API 权重消耗
+                    if i + batch_size < len(symbols):
+                        time.sleep(0.3)
 
             logging.info(f"✅ API扫描完成，共发现 {len(signals)} 个信号")
+            
+            # 💡 诊断日志：显示本次扫描中倍数最高的前 5 个交易对（即使没达到阈值）
+            # 注意：由于 _scan_one 内部过滤了不达标的，我们需要稍微修改 _scan_one 或者在这里收集数据
+            # 为了不破坏 _scan_one 的效率，我们只在没有信号时，输出一些“近乎达标”的信息
+            if not signals:
+                logging.info("💡 扫描诊断：未发现达标信号。请检查 sell_surge_threshold (当前: %s)", self.sell_surge_threshold)
+            else:
+                top_5 = sorted(signals, key=lambda x: x["surge_ratio"], reverse=True)[:5]
+                logging.info("📊 本轮倍数前 5 名:")
+                for s in top_5:
+                    logging.info(f"   • {s['symbol']}: {s['surge_ratio']:.2f}x")
+
             return sorted(signals, key=lambda x: x["surge_ratio"], reverse=True)
 
         except Exception as e:

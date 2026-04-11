@@ -330,7 +330,7 @@
     });
     _lwChart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
 
-    api('/api/klines?symbol=' + symbol + '&interval=' + iv + '&limit=200').then(({ data }) => {
+    api('/api/klines?symbol=' + symbol + '&interval=' + iv + '&limit=100').then(({ data }) => {
       if (!data || !data.success || !_lwChart) return;
       candles.setData(data.data);
       volSeries.setData(data.data.map((d) => ({
@@ -432,7 +432,7 @@
 
   async function refreshBtcChart() {
     if (!_btcChart || !_btcCandles) return;
-    const limit = _btcInterval === '1d' ? 365 : 200;
+    const limit = _btcInterval === '1d' ? 180 : 100;
     const { data } = await api('/api/klines?symbol=BTCUSDT&interval=' + _btcInterval + '&limit=' + limit);
     if (!data || !data.success || !_btcCandles) return;
     _btcCandles.setData(data.data);
@@ -996,19 +996,25 @@
 
   window.startTrading = async function () {
     const { data } = await api('/api/start_trading', { method: 'POST' });
-    alert((data && data.message) || 'done');
+    if (data && data.error) alert(data.error);
     await refreshData();
   };
 
   window.stopTrading = async function () {
     const { data } = await api('/api/stop_trading', { method: 'POST' });
-    alert((data && data.message) || 'done');
+    if (data && data.error) alert(data.error);
     await refreshData();
   };
 
   window.manualScan = async function () {
     const { data } = await api('/api/manual_scan', { method: 'POST' });
-    alert((data && (data.message || data.error)) || 'done');
+    if (data && data.error) {
+      alert(data.error);
+    } else {
+      // 无论是否有信号或建仓成功，均静默处理，仅在控制台打印
+      const msg = (data && data.message) || '手动扫描完成';
+      console.log(`[Manual Scan] ${msg}`);
+    }
     await refreshData();
   };
 

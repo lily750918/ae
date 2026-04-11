@@ -4,6 +4,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import state
 from utils.logging_config import flush_logging_handlers
 
 # NOTE: These functions reference ae_server module globals (strategy, is_running, etc.)
@@ -29,7 +30,10 @@ def scan_loop():
 
     while True:
         try:
-            if not ae_server.is_running:
+            if not state.is_running:
+                # 每 10 分钟打一次“休眠中”日志，避免刷屏但能确认线程活着
+                if int(time.time()) % 600 < 10:
+                    logging.info("📡 信号扫描线程：等待交易开启 (is_running=False)...")
                 time.sleep(10)
                 continue
 
@@ -37,25 +41,26 @@ def scan_loop():
             now = datetime.now(timezone.utc)
             current_hour = now.replace(minute=0, second=0, microsecond=0)
 
-            # 每小时3-8分钟扫描，且本小时未扫描过（v4 修复：窗口从 2 分钟扩大到 5 分钟）
-            if 3 <= now.minute < 8 and last_scan_hour != current_hour:
+            # 每小时 3-10 分钟扫描一次（宽限时间窗口）
+            is_in_window = 3 <= now.minute < 10
+            if is_in_window and last_scan_hour != current_hour:
                 logging.info(
-                    f"🔍 [定时扫描] UTC {now.strftime('%Y-%m-%d %H:%M:%S')} 开始扫描..."
+                    f"🔍 [定时扫描触发] 当前 UTC {now.strftime('%H:%M:%S')}，窗口[3-10]，准备开始..."
                 )
 
                 try:
-                    if not ae_server.strategy.server_sync_wallet_snapshot():
-                        ae_server.strategy.account_balance = ae_server.strategy.server_get_account_balance()
-                        ae_server.strategy.account_available_balance = ae_server.strategy.account_balance
+                    if not state.strategy.server_sync_wallet_snapshot():
+                        state.strategy.account_balance = state.strategy.server_get_account_balance()
+                        state.strategy.account_available_balance = state.strategy.account_balance
                     logging.info(
-                        f"💰 账户余额: ${ae_server.strategy.account_balance:.2f}  可用余额: ${ae_server.strategy.account_available_balance:.2f}"
+                        f"💰 账户余额: ${state.strategy.account_balance:.2f}  可用余额: ${state.strategy.account_available_balance:.2f}"
                     )
 
                     # 🔧 强制刷新日志
                     flush_logging_handlers()
 
                     # 扫描信号
-                    signals = ae_server.strategy.server_scan_sell_surge_signals()
+                    signals = state.strategy.server_scan_sell_surge_signals()
 
                     if signals:
                         logging.info(f"✅ 发现 {len(signals)} 个信号")
@@ -71,20 +76,21 @@ def scan_loop():
                         # 尝试建仓：与 hm1l 一致，按卖量倍数降序连续尝试（受 max_positions/max_daily_entries/可选 cap）
                         opened_count = 0
                         opened_syms = set()
-                        cap = ae_server.strategy.max_opens_per_scan
+                        cap = state.strategy.max_opens_per_scan
                         for signal in signals:
-                            if not ae_server.is_running:
+                            if not state.is_running:
                                 break
                             if cap > 0 and opened_count >= cap:
                                 break
-                            if ae_server.strategy.server_open_position(signal):
+                            if state.strategy.server_open_position(signal):
                                 opened_count += 1
                                 opened_syms.add(signal["symbol"])
                                 logging.info(
                                     f"🚀 开仓成功: {signal['symbol']} (本轮第{opened_count}笔)"
                                 )
 
-                        ae_server.save_signal_records(signals, now.isoformat(), opened_syms)
+                        from ae_server import save_signal_records
+                        save_signal_records(signals, now.isoformat(), opened_syms)
 
                         if opened_count == 0:
                             logging.warning(
@@ -125,7 +131,8 @@ def scan_loop():
                             )
                         elif consecutive_failures == 3:
                             logging.error(f"🚨 网络连续失败{consecutive_failures}次！")
-                            ae_server.send_email_alert(
+                            from utils.email import send_email_alert
+                            send_email_alert(
                                 "网络连续失败警告",
                                 f"信号扫描网络连续失败{consecutive_failures}次\n\n错误信息：{error_msg}",
                             )
@@ -133,7 +140,8 @@ def scan_loop():
                             logging.critical(
                                 f"🚨🚨🚨 网络连续失败{consecutive_failures}次！系统可能无法正常交易！"
                             )
-                            ae_server.send_email_alert(
+                            from utils.email import send_email_alert
+                            send_email_alert(
                                 "【紧急】网络严重异常",
                                 f"信号扫描网络连续失败{consecutive_failures}次！\n\n系统可能无法正常交易，请立即检查！\n\n错误信息：{error_msg}",
                             )
@@ -142,7 +150,8 @@ def scan_loop():
                             f"❌ 扫描错误 (第{consecutive_failures}次): {error_msg[:100]}"
                         )
                         if consecutive_failures >= 3:
-                            ae_server.send_email_alert(
+                            from utils.email import send_email_alert
+                            send_email_alert(
                                 "信号扫描异常",
                                 f"信号扫描连续失败{consecutive_failures}次\n\n错误信息：{error_msg}",
                             )
@@ -163,7 +172,7 @@ def scan_loop():
 
 def monitor_loop():
     """持仓监控循环（每30秒检查一次）"""
-    import ae_server
+    import state
 
     logging.info("👁️ 持仓监控线程已启动")
     consecutive_failures = 0  # 连续失败计数
@@ -171,21 +180,21 @@ def monitor_loop():
 
     while True:
         try:
-            if not ae_server.is_running:
+            if not state.is_running:
                 time.sleep(10)
                 continue
 
             check_count += 1
 
             # BTC 昨日阳线 → 新 UTC 日一刀切空仓（早于常规止盈止损扫描）
-            ae_server.strategy.server_maybe_btc_yesterday_yang_flatten_at_new_utc_day()
+            state.strategy.server_maybe_btc_yesterday_yang_flatten_at_new_utc_day()
 
             # 启动时加载失败 → 重试加载交易所持仓
-            if not ae_server.strategy.positions_loaded:
+            if not state.strategy.positions_loaded:
                 logging.warning("🔄 启动时未加载到交易所持仓，尝试重新加载...")
                 try:
-                    ae_server.strategy.server_load_existing_positions()
-                    if ae_server.strategy.positions_loaded:
+                    state.strategy.server_load_existing_positions()
+                    if state.strategy.positions_loaded:
                         logging.info("✅ 成功重新加载交易所持仓")
                     else:
                         logging.warning("⚠️ 重新加载失败，将在下次监控循环重试")
@@ -193,12 +202,12 @@ def monitor_loop():
                     logging.error(f"❌ 重新加载持仓失败: {load_err}")
 
             # 监控持仓
-            ae_server.strategy.server_monitor_positions()
+            state.strategy.server_monitor_positions()
 
             # 每10次检查（5分钟）输出一次状态
             if check_count % 10 == 0:
                 logging.info(
-                    f"👁️ [监控] 已检查{check_count}次，持仓{len(ae_server.strategy.positions)}个"
+                    f"👁️ [监控] 已检查{check_count}次，持仓{len(state.strategy.positions)}个"
                 )
                 # 🔧 强制刷新日志
                 flush_logging_handlers()
@@ -233,7 +242,8 @@ def monitor_loop():
                     logging.warning(f"🌐 持仓监控网络异常 (第{consecutive_failures}次)")
                 elif consecutive_failures >= 5:
                     logging.error(f"🚨 持仓监控网络连续失败{consecutive_failures}次！")
-                    ae_server.send_email_alert(
+                    from utils.email import send_email_alert
+                    send_email_alert(
                         "持仓监控网络异常",
                         f"持仓监控网络连续失败{consecutive_failures}次\n\n持仓显示可能延迟！\n\n错误信息：{error_msg}",
                     )
@@ -247,30 +257,32 @@ def monitor_loop():
 
 def daily_report_loop():
     """每个 UTC 自然日自动发送至多一次；本日已发过则长休眠至下一 UTC 日（不按小时反复检查）。"""
-    import ae_server
+    import state
 
     logging.info("📧 每日报告线程已启动（每 UTC 日最多自动 1 次）")
 
     while True:
         try:
-            if not ae_server.is_running:
+            if not state.is_running:
                 time.sleep(60)
                 continue
 
             now = datetime.now(timezone.utc)
             current_date = now.date()
-            last_sent = ae_server._daily_report_load_last_sent_date()
+            from utils.daily_report import _daily_report_load_last_sent_date, _seconds_sleep_until_after_next_utc_midnight, send_daily_report
+            last_sent = _daily_report_load_last_sent_date()
 
             if last_sent == current_date:
-                time.sleep(ae_server._seconds_sleep_until_after_next_utc_midnight(now))
+                time.sleep(_seconds_sleep_until_after_next_utc_midnight(now))
                 continue
 
             logging.info("📧 开始生成每日交易报告...")
-            ok = ae_server.send_daily_report()
+            ok = send_daily_report()
             if ok:
                 logging.info(f"📧 每日报告已完成 ({current_date})")
+                from utils.daily_report import _seconds_sleep_until_after_next_utc_midnight
                 time.sleep(
-                    ae_server._seconds_sleep_until_after_next_utc_midnight(
+                    _seconds_sleep_until_after_next_utc_midnight(
                         datetime.now(timezone.utc)
                     )
                 )

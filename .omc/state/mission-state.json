@@ -1,13 +1,13 @@
 {
-  "updatedAt": "2026-04-10T12:49:53.440Z",
+  "updatedAt": "2026-04-11T04:33:00.509Z",
   "missions": [
     {
-      "id": "session:2ccd9fac-e09c-4c3f-b69b-4d50541321e5:none",
+      "id": "session:c228963c-72ad-4bfe-b9d7-c30d20069c49:none",
       "source": "session",
       "name": "none",
       "objective": "Session mission",
-      "createdAt": "2026-04-10T12:44:47.520Z",
-      "updatedAt": "2026-04-10T12:49:53.440Z",
+      "createdAt": "2026-04-11T04:31:50.872Z",
+      "updatedAt": "2026-04-11T04:33:00.509Z",
       "status": "done",
       "workerCount": 1,
       "taskCounts": {
@@ -20,32 +20,32 @@
       },
       "agents": [
         {
-          "name": "security-reviewer:a65d9a1",
-          "role": "security-reviewer",
-          "ownership": "a65d9a19195b1f6c9",
+          "name": "Explore:a968a42",
+          "role": "Explore",
+          "ownership": "a968a428aa98321b9",
           "status": "done",
           "currentStep": null,
           "latestUpdate": "completed",
           "completedSummary": null,
-          "updatedAt": "2026-04-10T12:49:53.440Z"
+          "updatedAt": "2026-04-11T04:33:00.509Z"
         }
       ],
       "timeline": [
         {
-          "id": "session-start:a65d9a19195b1f6c9:2026-04-10T12:44:47.520Z",
-          "at": "2026-04-10T12:44:47.520Z",
+          "id": "session-start:a968a428aa98321b9:2026-04-11T04:31:50.872Z",
+          "at": "2026-04-11T04:31:50.872Z",
           "kind": "update",
-          "agent": "security-reviewer:a65d9a1",
-          "detail": "started security-reviewer:a65d9a1",
-          "sourceKey": "session-start:a65d9a19195b1f6c9"
+          "agent": "Explore:a968a42",
+          "detail": "started Explore:a968a42",
+          "sourceKey": "session-start:a968a428aa98321b9"
         },
         {
-          "id": "session-stop:a65d9a19195b1f6c9:2026-04-10T12:49:53.440Z",
-          "at": "2026-04-10T12:49:53.440Z",
+          "id": "session-stop:a968a428aa98321b9:2026-04-11T04:33:00.509Z",
+          "at": "2026-04-11T04:33:00.509Z",
           "kind": "completion",
-          "agent": "security-reviewer:a65d9a1",
+          "agent": "Explore:a968a42",
           "detail": "completed",
-          "sourceKey": "session-stop:a65d9a19195b1f6c9"
+          "sourceKey": "session-stop:a968a428aa98321b9"
         }
       ]
     }
